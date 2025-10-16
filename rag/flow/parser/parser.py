@@ -494,7 +494,7 @@ class Parser(ProcessBase):
         name = from_upstream.name
         if self._canvas._doc_id:
             b, n = File2DocumentService.get_storage_address(doc_id=self._canvas._doc_id)
-            blob = STORAGE_IMPL.get(b, n)
+            blob = STORAGE_IMPL.get(b, n, self._canvas._tenant_id)
         else:
             blob = FileService.get_blob(from_upstream.file["created_by"], from_upstream.file["id"])
 
