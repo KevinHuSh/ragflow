@@ -32,11 +32,12 @@ async def set_api_key():
     secret_key = req.get("secret_key", "")
     public_key = req.get("public_key", "")
     host = req.get("host", "")
+    tenant_id = current_user.id
     if not all([secret_key, public_key, host]):
         return get_error_data_result(message="Missing required fields")
 
     langfuse_keys = dict(
-        tenant_id=current_user.id,
+        tenant_id=tenant_id,
         secret_key=secret_key,
         public_key=public_key,
         host=host,
@@ -46,13 +47,13 @@ async def set_api_key():
     if not langfuse.auth_check():
         return get_error_data_result(message="Invalid Langfuse keys")
 
-    langfuse_entry = TenantLangfuseService.filter_by_tenant(tenant_id=current_user.id)
+    langfuse_entry = TenantLangfuseService.filter_by_tenant(tenant_id=tenant_id)
     with DB.atomic():
         try:
             if not langfuse_entry:
                 TenantLangfuseService.save(**langfuse_keys)
             else:
-                TenantLangfuseService.update_by_tenant(tenant_id=current_user.id, langfuse_keys=langfuse_keys)
+                TenantLangfuseService.update_by_tenant(tenant_id=tenant_id, langfuse_keys=langfuse_keys)
             return get_json_result(data=langfuse_keys)
         except Exception as e:
             server_error_response(e)
