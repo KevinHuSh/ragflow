@@ -17,7 +17,7 @@
 import asyncio
 import pathlib
 import re
-from quart import request, make_response
+from api.tornado_compat import request, make_response
 from pathlib import Path
 
 from api.db.services.document_service import DocumentService

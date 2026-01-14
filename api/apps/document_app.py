@@ -19,7 +19,7 @@ import os.path
 import pathlib
 import re
 from pathlib import Path
-from quart import request, make_response
+from api.tornado_compat import request, make_response
 from api.apps import current_user, login_required
 from api.common.check_team_permission import check_kb_team_permission
 from api.constants import FILE_NAME_LEN_LIMIT, IMG_BASE64_PREFIX

@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 import base64
 
-from quart import make_response, redirect, request, session
+from api.tornado_compat import make_response, redirect, request, session
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from api.apps.auth import get_auth_client

@@ -24,7 +24,7 @@ import aiosmtplib
 from email.mime.text import MIMEText
 from email.header import Header
 from common import settings
-from quart import render_template_string
+from api.tornado_compat import render_template_string
 from api.utils.email_templates import EMAIL_TEMPLATES
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException

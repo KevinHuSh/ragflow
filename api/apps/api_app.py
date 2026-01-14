@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 from datetime import datetime, timedelta
-from quart import request
+from api.tornado_compat import request
 from api.db.db_models import APIToken
 from api.db.services.api_service import APITokenService, API4ConversationService
 from api.db.services.user_service import UserTenantService

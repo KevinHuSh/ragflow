@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 import logging
-from quart import request
+from api.tornado_compat import request
 from api.db.services.dialog_service import DialogService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.tenant_llm_service import TenantLLMService

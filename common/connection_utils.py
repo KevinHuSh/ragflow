@@ -20,7 +20,7 @@ import threading
 from typing import Any, Callable, Coroutine, Optional, Type, Union
 import asyncio
 from functools import wraps
-from quart import make_response, jsonify
+from api.tornado_compat import make_response, jsonify
 from common.constants import RetCode
 
 TimeoutException = Union[Type[BaseException], BaseException]

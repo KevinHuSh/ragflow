@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 
-from quart import request
+from api.tornado_compat import request
 from api.apps import current_user, login_required
 
 from api.constants import DATASET_NAME_LIMIT

@@ -19,7 +19,7 @@ import re
 import logging
 from copy import deepcopy
 import tempfile
-from quart import Response, request
+from api.tornado_compat import Response, request
 from api.apps import current_user, login_required
 from api.db.db_models import APIToken
 from api.db.services.conversation_service import ConversationService, structure_answer

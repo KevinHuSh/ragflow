@@ -18,7 +18,7 @@
 import logging
 import os
 import json
-from quart import request
+from api.tornado_compat import request
 from peewee import OperationalError
 from api.db.db_models import File
 from api.db.services.document_service import DocumentService, queue_raptor_o_graphrag_tasks

@@ -137,11 +137,7 @@ if __name__ == '__main__':
         t = threading.Thread(target=update_progress, daemon=True)
         t.start()
 
-    if RuntimeConfig.DEBUG:
-        if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-            threading.Timer(1.0, delayed_start_update_progress).start()
-    else:
-        threading.Timer(1.0, delayed_start_update_progress).start()
+    threading.Timer(1.0, delayed_start_update_progress).start()
 
     # start http server
     try:

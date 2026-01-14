@@ -18,7 +18,7 @@ import asyncio
 import os
 import pathlib
 import re
-from quart import request, make_response
+from api.tornado_compat import request, make_response
 from api.apps import login_required, current_user
 
 from api.common.check_team_permission import check_file_team_permission

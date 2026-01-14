@@ -21,7 +21,7 @@ import re
 from io import BytesIO
 
 import xxhash
-from quart import request, send_file
+from api.tornado_compat import request, send_file
 from peewee import OperationalError
 from pydantic import BaseModel, Field, validator
 

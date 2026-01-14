@@ -16,7 +16,7 @@
 import logging
 import json
 import os
-from quart import request
+from api.tornado_compat import request
 
 from api.apps import login_required, current_user
 from api.db.services.tenant_llm_service import LLMFactoriesService, TenantLLMService

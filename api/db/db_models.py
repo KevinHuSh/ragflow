@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import wraps
 
-from quart_auth import AuthUser
+from api.tornado_compat import AuthUser
 from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
 from peewee import InterfaceError, OperationalError, BigIntegerField, BooleanField, CharField, CompositeKey, DateTimeField, Field, FloatField, IntegerField, Metadata, Model, TextField
 from playhouse.migrate import MySQLMigrator, PostgresqlMigrator, migrate

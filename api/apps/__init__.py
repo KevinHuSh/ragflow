@@ -18,17 +18,17 @@ import os
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
-from quart import Blueprint, Quart, request, g, current_app, session
+from api.tornado_compat import Blueprint, Quart, request, g, current_app, session
 from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
-from quart_cors import cors
+from api.tornado_compat import cors
 from common.constants import StatusEnum
 from api.db.db_models import close_connection, APIToken
 from api.db.services import UserService
 from api.utils.json_encode import CustomJSONEncoder
 from api.utils import commands
 
-from quart_auth import Unauthorized
-from quart_schema import QuartSchema
+from api.tornado_compat import Unauthorized
+from api.tornado_compat import QuartSchema
 from common import settings
 from api.utils.api_utils import server_error_response
 from api.constants import API_VERSION

@@ -25,7 +25,7 @@ Provides REST API for RAG evaluation functionality including:
 - Configuration recommendations
 """
 
-from quart import request
+from api.tornado_compat import request
 from api.apps import login_required, current_user
 from api.db.services.evaluation_service import EvaluationService
 from api.utils.api_utils import (

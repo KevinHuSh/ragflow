@@ -26,7 +26,7 @@ from functools import wraps
 from typing import Any
 
 import requests
-from quart import (
+from api.tornado_compat import (
     Response,
     jsonify,
     request

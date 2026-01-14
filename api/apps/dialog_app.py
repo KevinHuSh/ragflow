@@ -14,7 +14,7 @@
 #  limitations under the License.
 #
 
-from quart import request
+from api.tornado_compat import request
 from api.db.services import duplicate_name
 from api.db.services.dialog_service import DialogService
 from common.constants import StatusEnum

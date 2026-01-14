@@ -15,7 +15,7 @@
 #
 import logging
 
-from quart import request
+from api.tornado_compat import request
 from api.apps import login_required, current_user
 from api.db import TenantPermission
 from api.db.services.memory_service import MemoryService

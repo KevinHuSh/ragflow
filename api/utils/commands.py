@@ -18,7 +18,7 @@ import base64
 import click
 import re
 
-from quart import Quart
+from api.tornado_compat import Quart
 from werkzeug.security import generate_password_hash
 
 from api.db.services import UserService

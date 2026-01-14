@@ -18,7 +18,7 @@ import string
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from quart import Request
+from api.tornado_compat import Request
 from pydantic import (
     BaseModel,
     ConfigDict,

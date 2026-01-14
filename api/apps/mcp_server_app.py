@@ -15,7 +15,7 @@
 #
 import asyncio
 
-from quart import Response, request
+from api.tornado_compat import Response, request
 from api.apps import current_user, login_required
 
 from api.db.db_models import MCPServer

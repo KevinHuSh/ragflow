@@ -19,7 +19,7 @@ import re
 import time
 
 import tiktoken
-from quart import Response, jsonify, request
+from api.tornado_compat import Response, jsonify, request
 
 from agent.canvas import Canvas
 from api.db.db_models import APIToken

@@ -15,7 +15,7 @@
 #
 import logging
 
-from quart import jsonify
+from api.tornado_compat import jsonify
 
 from api.db.services.document_service import DocumentService
 from api.db.services.knowledgebase_service import KnowledgebaseService

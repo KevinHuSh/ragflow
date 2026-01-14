@@ -19,7 +19,7 @@ import random
 import re
 import asyncio
 
-from quart import request
+from api.tornado_compat import request
 import numpy as np
 
 from api.db.services.connector_service import Connector2KbService

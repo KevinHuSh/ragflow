@@ -13,7 +13,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-from quart import request
+from api.tornado_compat import request
 from api.apps import login_required
 from api.db.services.memory_service import MemoryService
 from common.time_utils import current_timestamp, timestamp_to_date

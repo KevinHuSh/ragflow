@@ -18,7 +18,7 @@ import inspect
 import json
 import logging
 from functools import partial
-from quart import request, Response, make_response
+from api.tornado_compat import request, Response, make_response
 from agent.component import LLM
 from api.db import CanvasCategory
 from api.db.services.canvas_service import CanvasTemplateService, UserCanvasService, API4ConversationService
