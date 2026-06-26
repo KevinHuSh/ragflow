@@ -1,3 +1,4 @@
+import { useIsDarkTheme } from '@/components/theme-provider';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -19,6 +20,7 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import message from '@/components/ui/message';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { useFetchBuiltinCompilationTemplates } from '@/hooks/use-compilation-template-request';
 import { useFetchDefaultModelDictionary } from '@/hooks/use-llm-request';
@@ -28,6 +30,11 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useEffect, useMemo } from 'react';
 import { FormProvider, useForm } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import {
+  oneDark,
+  oneLight,
+} from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { ArtifactExtras } from './components/artifact-extras';
 import { BuiltinTemplatePopover } from './components/builtin-template-popover';
 import { EntityRelationSection } from './components/entity-relation-section';
@@ -97,6 +104,7 @@ export function EditTemplateForm({
   loading,
 }: EditTemplateFormProps) {
   const { t } = useTranslation();
+  const isDarkTheme = useIsDarkTheme();
   const { data: builtins } = useFetchBuiltinCompilationTemplates();
   // Default chat model from /v1/models/default — used as the prefill for
   // ``llm_id`` when the user opens the form to create a fresh template
@@ -174,10 +182,25 @@ export function EditTemplateForm({
   );
 
   const kind = form.watch('kind');
+  const watchedValues = form.watch();
   const fieldTemplates = useMemo(
     () => buildFieldTemplateMaps(builtins.map((builtin) => builtin.config)),
     [builtins],
   );
+  const rawJson = useMemo(() => {
+    const name = watchedValues.name?.trim() ?? '';
+    const description = watchedValues.description || undefined;
+    return JSON.stringify(
+      {
+        name,
+        description,
+        kind: watchedValues.kind,
+        config: formValuesToTemplateConfig(watchedValues),
+      },
+      null,
+      2,
+    );
+  }, [watchedValues]);
 
   const handleSubmit = form.handleSubmit(
     async (values) => {
@@ -217,120 +240,151 @@ export function EditTemplateForm({
     <FormProvider {...form}>
       <Form {...form}>
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <div className="flex items-start gap-3">
-            <FormField
-              control={form.control}
-              name="name"
-              render={({ field }) => (
-                <FormItem className="flex-1">
-                  <FormLabel>{t('knowledgeCompilation.name')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      {...field}
-                      maxLength={128}
-                      placeholder={t('knowledgeCompilation.namePlaceholder')}
-                      autoFocus
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <div className="pt-7">
-              <BuiltinTemplatePopover onSelect={handleSelectBuiltin} />
-            </div>
-          </div>
+          <Tabs defaultValue="editor" className="w-full">
+            <TabsList>
+              <TabsTrigger value="editor">
+                {t('knowledgeCompilation.editorTab')}
+              </TabsTrigger>
+              <TabsTrigger value="raw">
+                {t('knowledgeCompilation.rawJsonTab')}
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="editor" className="flex flex-col gap-4">
+              <div className="flex items-start gap-3">
+                <FormField
+                  control={form.control}
+                  name="name"
+                  render={({ field }) => (
+                    <FormItem className="flex-1">
+                      <FormLabel>{t('knowledgeCompilation.name')}</FormLabel>
+                      <FormControl>
+                        <Input
+                          {...field}
+                          maxLength={128}
+                          placeholder={t(
+                            'knowledgeCompilation.namePlaceholder',
+                          )}
+                          autoFocus
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <div className="pt-7">
+                  <BuiltinTemplatePopover onSelect={handleSelectBuiltin} />
+                </div>
+              </div>
 
-          <FormField
-            control={form.control}
-            name="description"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('knowledgeCompilation.description')}</FormLabel>
-                <FormControl>
-                  <Input
-                    {...field}
-                    maxLength={TEXT_FIELD_MAX}
-                    placeholder={t(
-                      'knowledgeCompilation.descriptionPlaceholder',
-                    )}
-                  />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+              <FormField
+                control={form.control}
+                name="description"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>
+                      {t('knowledgeCompilation.description')}
+                    </FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        maxLength={TEXT_FIELD_MAX}
+                        placeholder={t(
+                          'knowledgeCompilation.descriptionPlaceholder',
+                        )}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-          <FormField
-            control={form.control}
-            name="llm_id"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('knowledgeCompilation.llmLabel')}</FormLabel>
-                <FormControl>
-                  <LLMSelect isEdit field={field} />
-                </FormControl>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+              <FormField
+                control={form.control}
+                name="llm_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('knowledgeCompilation.llmLabel')}</FormLabel>
+                    <FormControl>
+                      <LLMSelect isEdit field={field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
 
-          {/* Page-structure example for the REFINE writer. Sits at the
+              {/* Page-structure example for the REFINE writer. Sits at the
               top of the artifact-specific area (directly under LLM) so
               the user sees and can edit it before the lower-priority
               Entity / Relation / Claim / Concept blocks. The
               ``example`` value is prefilled from the artifacts built-in
               by the useEffect above when empty. */}
-          {kind === 'artifacts' && (
-            <FormField
-              control={form.control}
-              name="example"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>
-                    {t('knowledgeCompilation.exampleLabel')}
-                  </FormLabel>
-                  <FormControl>
-                    <Textarea
-                      rows={10}
-                      maxLength={8000}
-                      className="font-mono text-sm"
-                      placeholder={t('knowledgeCompilation.examplePlaceholder')}
-                      value={field.value ?? ''}
-                      onBlur={field.onBlur}
-                      onChange={field.onChange}
-                      name={field.name}
-                      ref={field.ref}
-                    />
-                  </FormControl>
-                  <p className="text-xs text-text-secondary">
-                    {t('knowledgeCompilation.exampleDescription')}
-                  </p>
-                  <FormMessage />
-                </FormItem>
+              {kind === 'artifacts' && (
+                <FormField
+                  control={form.control}
+                  name="example"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>
+                        {t('knowledgeCompilation.exampleLabel')}
+                      </FormLabel>
+                      <FormControl>
+                        <Textarea
+                          rows={10}
+                          maxLength={8000}
+                          className="font-mono text-sm"
+                          placeholder={t(
+                            'knowledgeCompilation.examplePlaceholder',
+                          )}
+                          value={field.value ?? ''}
+                          onBlur={field.onBlur}
+                          onChange={field.onChange}
+                          name={field.name}
+                          ref={field.ref}
+                        />
+                      </FormControl>
+                      <p className="text-xs text-text-secondary">
+                        {t('knowledgeCompilation.exampleDescription')}
+                      </p>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
               )}
-            />
-          )}
 
-          {kind !== 'tree' && (
-            <>
-              <EntityRelationSection
-                variant="entity"
-                kind={kind}
-                fieldTemplates={fieldTemplates.entity}
-              />
-              <EntityRelationSection
-                variant="relation"
-                kind={kind}
-                fieldTemplates={fieldTemplates.relation}
-              />
-            </>
-          )}
+              {kind !== 'tree' && (
+                <>
+                  <EntityRelationSection
+                    variant="entity"
+                    kind={kind}
+                    fieldTemplates={fieldTemplates.entity}
+                  />
+                  <EntityRelationSection
+                    variant="relation"
+                    kind={kind}
+                    fieldTemplates={fieldTemplates.relation}
+                  />
+                </>
+              )}
 
-          {kind === 'artifacts' && <ArtifactExtras />}
-          {kind === 'tree' && <TreeExtras />}
+              {kind === 'artifacts' && <ArtifactExtras />}
+              {kind === 'tree' && <TreeExtras />}
 
-          <GlobalRulesBlock />
+              <GlobalRulesBlock />
+            </TabsContent>
+            <TabsContent value="raw">
+              <div className="rounded-md border border-border-button bg-bg-base">
+                <SyntaxHighlighter
+                  className="max-h-[62vh] overflow-auto scrollbar-auto !m-0 rounded-md text-sm"
+                  language="json"
+                  style={isDarkTheme ? oneDark : oneLight}
+                  wrapLongLines
+                  showLineNumbers
+                >
+                  {rawJson}
+                </SyntaxHighlighter>
+              </div>
+            </TabsContent>
+          </Tabs>
 
           <div className="flex justify-end gap-2 pt-2 border-t border-border-button">
             <Button type="button" variant="ghost" onClick={onCancel}>

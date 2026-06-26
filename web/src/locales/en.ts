@@ -3012,6 +3012,8 @@ Important structured information may include: names, dates, locations, events, k
         'Use {{cluster_content}} as the placeholder for the texts to summarize.',
       treeMaxTokenLabel: 'Max token',
       treeThresholdLabel: 'Threshold',
+      editorTab: 'Editor',
+      rawJsonTab: 'Raw JSON',
       addTemplate: 'Add template',
       editTemplate: 'Edit template',
       empty: 'No templates yet. Create one to get started.',
