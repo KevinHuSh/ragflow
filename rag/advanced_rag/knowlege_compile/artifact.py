@@ -1534,7 +1534,7 @@ async def artifact_reduce_from_extracts(
 
 ARTIFACT_PLAN_COMPILE_KWD = "artifact_compilation_plan"
 ARTIFACT_PAGE_COMPILE_KWD = "artifact_page"
-DEFAULT_ARTIFACT_PLAN_UPDATE_THRESHOLD = 0.85
+DEFAULT_ARTIFACT_PLAN_UPDATE_THRESHOLD = 0.95
 DEFAULT_ARTIFACT_PLAN_MAYBE_THRESHOLD = 0.60
 DEFAULT_ARTIFACT_PLAN_TIMEOUT = 600  # ~10 min — the planning call emits one big
                                  # JSON plan and reasoning models can spend a
@@ -1625,6 +1625,7 @@ Examples of BAD slugs (do NOT produce):
   - ``concept/logistics-channels-1``   (numeric suffix to distinguish pages)
   - ``concept/logistics-channels-abc`` (random hex tag)
   - ``logistics/concept-channels``     (type and topic order swapped)
+  - ``concept/example-name``           (just duplicate the sample)
 
 # Other rules
 - Group closely related small entities onto the same page (max 3-4 per page).
@@ -1745,8 +1746,8 @@ async def _artifact_reconcile_with_kb(
 
     index = _rag_search.index_name(tenant_id)
     condition = {"compile_kwd": [ARTIFACT_PAGE_COMPILE_KWD]}
-    select_fields = ["id", "slug_kwd", "title_kwd", "page_type_kwd"]
 
+    select_fields = ["id", "slug_kwd", "title_kwd", "page_type_kwd", "_score"]
     for (_kind, key, _src), vec in zip(items, vectors):
         vec_list = list(vec) if not hasattr(vec, "tolist") else vec.tolist()
         if not vec_list:
@@ -1761,7 +1762,7 @@ async def _artifact_reconcile_with_kb(
             embedding_data_type="float",
             distance_type="cosine",
             topn=1,
-            extra_options={"similarity": maybe_threshold},
+            extra_options={"similarity": update_threshold},
         )
         try:
             res = await thread_pool_exec(
@@ -1789,9 +1790,7 @@ async def _artifact_reconcile_with_kb(
         # Pull similarity from the search result if exposed; fall back to threshold floor.
         sim = 0.0
         try:
-            sim_field = getattr(res, "similarity", None) or getattr(res, "scores", None)
-            if isinstance(sim_field, dict) and top_id in sim_field:
-                sim = float(sim_field[top_id])
+            sim = float(getattr(top_row, "_score", None))
         except Exception:
             sim = 0.0
         if sim <= 0.0:
