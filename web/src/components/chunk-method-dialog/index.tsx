@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/form';
 import { DocumentParserType, ParseType } from '@/constants/knowledge';
 import { useTranslate } from '@/hooks/common-hooks';
-import { useFetchSavedCompilationTemplates } from '@/hooks/use-compilation-template-request';
+import { useFetchSavedCompilationTemplateGroups } from '@/hooks/use-compilation-template-request';
 import { useFetchKnowledgeBaseConfiguration } from '@/hooks/use-knowledge-request';
 import { IModalProps } from '@/interfaces/common';
 import { IParserConfig } from '@/interfaces/database/document';
@@ -72,26 +72,27 @@ const FormId = 'ChunkMethodDialogForm';
 function KnowledgeCompilationTemplateSelect() {
   const form = useFormContext();
   const { t } = useTranslate('knowledgeConfiguration');
-  const { data, loading } = useFetchSavedCompilationTemplates();
+  const { data, loading } = useFetchSavedCompilationTemplateGroups();
 
   const options = useMemo(
     () =>
-      data.templates.map((template) => ({
-        label: template.name,
-        value: template.id,
+      data.groups.map((group) => ({
+        label: group.name,
+        value: group.id,
+        scope: group.scope,
       })),
-    [data.templates],
+    [data.groups],
   );
 
   return (
     <FormField
       control={form.control}
-      name="parser_config.compilation_template_ids"
+      name="parser_config.compilation_template_group_id"
       render={({ field }) => {
-        const selectedValues = Array.isArray(field.value) ? field.value : [];
-        const selectedLabels = options
-          .filter((option) => selectedValues.includes(option.value))
-          .map((option) => option.label);
+        const selectedValue =
+          typeof field.value === 'string' ? field.value : '';
+        const selectedLabel =
+          options.find((option) => option.value === selectedValue)?.label ?? '';
 
         return (
           <FormItem>
@@ -106,12 +107,8 @@ function KnowledgeCompilationTemplateSelect() {
                     className="w-full justify-between px-3 font-normal"
                   >
                     <span className="truncate text-left">
-                      {selectedLabels.length > 0
-                        ? selectedLabels.join(', ')
-                        : t('knowledgeCompilationTemplatePlaceholder')}
-                    </span>
-                    <span className="ml-2 text-xs text-text-secondary">
-                      {selectedValues.length}
+                      {selectedLabel ||
+                        t('knowledgeCompilationTemplatePlaceholder')}
                     </span>
                   </Button>
                 </PopoverTrigger>
@@ -126,23 +123,30 @@ function KnowledgeCompilationTemplateSelect() {
                         {t('knowledgeCompilationTemplateEmpty')}
                       </CommandEmpty>
                       <CommandGroup>
+                        {/* Sentinel for clearing the selection — the
+                            doc's compilation runs are gated on this
+                            id being non-empty, so an explicit "None"
+                            row keeps the form a single-select. */}
+                        <CommandItem
+                          value="__none__"
+                          onSelect={() => field.onChange('')}
+                        >
+                          <Checkbox checked={!selectedValue} className="mr-2" />
+                          <span>{t('common.none')}</span>
+                        </CommandItem>
                         {options.map((option) => {
-                          const checked = selectedValues.includes(option.value);
+                          const checked = selectedValue === option.value;
                           return (
                             <CommandItem
                               key={option.value}
                               value={option.label}
-                              onSelect={() => {
-                                const nextValues = checked
-                                  ? selectedValues.filter(
-                                      (value) => value !== option.value,
-                                    )
-                                  : [...selectedValues, option.value];
-                                field.onChange(nextValues);
-                              }}
+                              onSelect={() => field.onChange(option.value)}
                             >
                               <Checkbox checked={checked} className="mr-2" />
-                              <span>{option.label}</span>
+                              <span className="flex-1">{option.label}</span>
+                              <span className="ml-2 text-xs uppercase text-text-secondary">
+                                {option.scope}
+                              </span>
                             </CommandItem>
                           );
                         })}
@@ -227,7 +231,7 @@ export function ChunkMethodDialog({
         mineru_formula_enable: z.boolean().optional(),
         mineru_table_enable: z.boolean().optional(),
         mineru_lang: z.string().optional(),
-        compilation_template_ids: z.array(z.string()).optional(),
+        compilation_template_group_id: z.string().optional(),
         raptor: z
           .object({
             use_raptor: z.boolean().optional(),
@@ -324,9 +328,14 @@ export function ChunkMethodDialog({
     const imageTableContextWindow = Number(
       parserConfig?.image_table_context_window || 0,
     );
+    // ``compilation_template_id`` / ``compilation_template_ids`` are
+    // legacy parser_config keys (pre template-group refactor). Strip
+    // them on save so the doc's parser_config doesn't accumulate
+    // dead fields alongside the new ``compilation_template_group_id``.
     const restParserConfig = omit(
       parserConfig as any,
       'compilation_template_id',
+      'compilation_template_ids',
     );
     const nextData = {
       ...data,
@@ -375,12 +384,14 @@ export function ChunkMethodDialog({
         parseType: pipelineId ? ParseType.Pipeline : ParseType.BuiltIn,
         parser_config: fillDefaultParserValue({
           pages: pages.length > 0 ? pages : [{ from: 1, to: 1024 }],
-          ...omit(parserConfig, 'pages', 'compilation_template_id'),
-          compilation_template_ids:
-            parserConfig?.compilation_template_ids ??
-            ((parserConfig as any)?.compilation_template_id
-              ? [(parserConfig as any).compilation_template_id]
-              : []),
+          ...omit(
+            parserConfig,
+            'pages',
+            'compilation_template_id',
+            'compilation_template_ids',
+          ),
+          compilation_template_group_id:
+            (parserConfig as any)?.compilation_template_group_id ?? '',
           image_table_context_window:
             parserConfig?.image_table_context_window ??
             parserConfig?.image_context_size ??

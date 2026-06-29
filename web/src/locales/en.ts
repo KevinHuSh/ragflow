@@ -3072,6 +3072,19 @@ Important structured information may include: names, dates, locations, events, k
         tree: 'Tree',
         empty: 'Empty',
       },
+      // Group editor strings (template-group refactor)
+      addTemplateGroup: 'Add template group',
+      editTemplateGroup: 'Edit template group',
+      addChildTemplate: 'Add template',
+      groupName: 'Group name',
+      groupNamePlaceholder: 'A short label for this template group',
+      groupScopeLabel: 'Scope',
+      kindLabel: 'Kind',
+      unnamedTemplate: 'Untitled template',
+      scope: {
+        file: 'File',
+        dataset: 'Dataset',
+      },
     },
     search: {
       searchApps: 'Search apps',

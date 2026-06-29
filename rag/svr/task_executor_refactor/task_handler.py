@@ -45,6 +45,7 @@ from typing import AsyncIterator, Callable, Dict, List, Optional
 from api.db.services.document_service import DocumentService, queue_per_doc_raptor_task
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.compilation_template_service import CompilationTemplateService
+from api.db.services.compilation_template_group_service import CompilationTemplateGroupService
 from api.db.joint_services.memory_message_service import handle_save_to_memory_task
 from api.db.joint_services.tenant_model_service import (
     get_tenant_default_model_by_type,
@@ -73,24 +74,38 @@ from common import settings
 
 
 
-def _parser_config_compilation_template_ids(parser_config) -> list[str]:
+def _parser_config_compilation_template_group_id(parser_config) -> str:
+    """Read the single template-group id from a doc's parser_config.
+
+    Templates were previously referenced as a list
+    (``compilation_template_ids``); after the template-group refactor
+    a doc instead points at a single group, and the orchestrator
+    resolves the group's child templates at runtime. Old
+    ``compilation_template_ids`` data is intentionally ignored per
+    the migration spec.
+    """
     if not isinstance(parser_config, dict):
-        return []
-    ids = parser_config.get("compilation_template_ids")
-    if isinstance(ids, list):
-        return [str(x).strip() for x in ids if isinstance(x, str) and x.strip()]
-    legacy = parser_config.get("compilation_template_id")
-    if isinstance(legacy, str) and legacy.strip():
-        return [legacy.strip()]
+        return ""
+    gid = parser_config.get("compilation_template_group_id")
+    if isinstance(gid, str) and gid.strip():
+        return gid.strip()
     ext = parser_config.get("ext")
     if isinstance(ext, dict):
-        ids = ext.get("compilation_template_ids")
-        if isinstance(ids, list):
-            return [str(x).strip() for x in ids if isinstance(x, str) and x.strip()]
-        legacy = ext.get("compilation_template_id")
-        if isinstance(legacy, str) and legacy.strip():
-            return [legacy.strip()]
-    return []
+        gid = ext.get("compilation_template_group_id")
+        if isinstance(gid, str) and gid.strip():
+            return gid.strip()
+    return ""
+
+
+def _parser_config_compilation_template_ids(parser_config, tenant_id: str) -> list[str]:
+    """Resolve a doc's parser_config to its compile-template ids by
+    looking up the configured group. Returns ``[]`` if the doc has no
+    group set or the group cannot be resolved.
+    """
+    group_id = _parser_config_compilation_template_group_id(parser_config)
+    if not group_id:
+        return []
+    return CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id)
 
 
 def _resolve_template_chat_llm_id(parser_cfg: dict, ctx) -> str:
@@ -844,7 +859,7 @@ class TaskHandler:
         constant in the number of templates.
         """
         ctx = self._task_context
-        template_ids = _parser_config_compilation_template_ids(ctx.parser_config)
+        template_ids = _parser_config_compilation_template_ids(ctx.parser_config, ctx.tenant_id)
         if not template_ids:
             return
 
@@ -1290,7 +1305,7 @@ class TaskHandler:
         eligible = []
         for d in all_docs or []:
             pc = d.get("parser_config") or {}
-            for template_id in _parser_config_compilation_template_ids(pc):
+            for template_id in _parser_config_compilation_template_ids(pc, ctx.tenant_id):
                 template = CompilationTemplateService.get_saved(template_id, ctx.tenant_id)
                 config = template.get("config") if template else {}
                 kind = _compilation_template_kind(config.get("kind") if isinstance(config, dict) else "")

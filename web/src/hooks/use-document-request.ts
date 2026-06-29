@@ -126,13 +126,16 @@ export const useFetchDocumentList = (loop = true) => {
   const [docs, setDocs] = useState<IDocumentInfo[]>([]);
 
   const withCompilationTemplateCount = useCallback((doc: IDocumentInfo) => {
-    const ids =
-      doc.parser_config?.compilation_template_ids?.filter(Boolean) ?? [];
-    const count = ids.length;
+    // Post template-group refactor a doc references a single group id
+    // (1 if set, 0 otherwise) instead of a list of template ids. The
+    // table column still surfaces a count for UX continuity.
+    const hasGroup = Boolean(
+      doc.parser_config?.compilation_template_group_id?.trim?.(),
+    );
     return {
       ...doc,
-      compilation_template_count: count,
-      has_compilation_template: count > 0,
+      compilation_template_count: hasGroup ? 1 : 0,
+      has_compilation_template: hasGroup,
     };
   }, []);
 

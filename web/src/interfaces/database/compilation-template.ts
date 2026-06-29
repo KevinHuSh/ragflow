@@ -103,6 +103,35 @@ export interface CompilationTemplateListResponse {
   templates: CompilationTemplate[];
 }
 
+export const COMPILATION_TEMPLATE_GROUP_SCOPES = ['file', 'dataset'] as const;
+export type CompilationTemplateGroupScope =
+  (typeof COMPILATION_TEMPLATE_GROUP_SCOPES)[number];
+
+/**
+ * Knowledge compilation template group — the top-level entity the UI
+ * manages and the doc parser_config references. A group is either:
+ *
+ * - One artifacts-kind template (``scope: 'dataset'``), or
+ * - N non-artifacts templates (``scope: 'file'``), mutually exclusive.
+ *
+ * The orchestrator resolves a doc's ``parser_config.compilation_template_group_id``
+ * into the group's child template ids at runtime.
+ */
+export interface CompilationTemplateGroup {
+  id: string;
+  name: string;
+  description?: string;
+  scope: CompilationTemplateGroupScope;
+  templates: CompilationTemplate[];
+  create_time?: number;
+  update_time?: number;
+}
+
+export interface CompilationTemplateGroupListResponse {
+  total: number;
+  groups: CompilationTemplateGroup[];
+}
+
 /**
  * Same shape as {@link CompilationTemplate} but without persistence
  * metadata — used for the read-only built-in YAML defaults.

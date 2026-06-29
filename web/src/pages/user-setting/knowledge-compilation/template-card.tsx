@@ -1,5 +1,6 @@
 import { CardContainer } from '@/components/card-container';
 import { ConfirmDeleteDialog } from '@/components/confirm-delete-dialog';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -9,22 +10,22 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
-import { CompilationTemplate } from '@/interfaces/database/compilation-template';
+import { CompilationTemplateGroup } from '@/interfaces/database/compilation-template';
 import { Pencil, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-interface TemplateCardProps {
-  data: CompilationTemplate;
+interface GroupCardProps {
+  data: CompilationTemplateGroup;
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
 /**
- * Single row in the templates list. Click anywhere on the card to edit;
- * the explicit pencil button is provided for affordance, and the trash
- * button opens a confirm dialog.
+ * Single card in the template-groups list. Header shows name +
+ * description; body shows the scope badge and one chip per child
+ * template kind. Clicking anywhere on the card opens the editor.
  */
-export function TemplateCard({ data, onEdit, onDelete }: TemplateCardProps) {
+export function TemplateGroupCard({ data, onEdit, onDelete }: GroupCardProps) {
   const { t } = useTranslation();
 
   return (
@@ -50,7 +51,16 @@ export function TemplateCard({ data, onEdit, onDelete }: TemplateCardProps) {
           </CardDescription>
         </div>
       </CardHeader>
-      <CardContent />
+      <CardContent className="flex flex-wrap gap-1.5">
+        <Badge variant="secondary">
+          {t(`knowledgeCompilation.scope.${data.scope}`)}
+        </Badge>
+        {data.templates.map((tpl) => (
+          <Badge key={tpl.id} variant="outline" title={tpl.name}>
+            {t(`knowledgeCompilation.kind.${tpl.kind}`)}
+          </Badge>
+        ))}
+      </CardContent>
       <CardFooter
         className="flex justify-end gap-2"
         onClick={(e) => e.stopPropagation()}
@@ -82,21 +92,21 @@ export function TemplateCard({ data, onEdit, onDelete }: TemplateCardProps) {
   );
 }
 
-interface TemplateCardListProps {
-  items: CompilationTemplate[];
+interface GroupCardListProps {
+  items: CompilationTemplateGroup[];
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
 }
 
-export function TemplateCardList({
+export function TemplateGroupCardList({
   items,
   onEdit,
   onDelete,
-}: TemplateCardListProps) {
+}: GroupCardListProps) {
   return (
     <CardContainer>
       {items.map((item) => (
-        <TemplateCard
+        <TemplateGroupCard
           key={item.id}
           data={item}
           onEdit={onEdit}

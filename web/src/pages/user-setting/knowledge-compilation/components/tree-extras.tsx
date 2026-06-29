@@ -9,7 +9,14 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { useFormContext } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
-import { CompilationTemplateFormValues } from '../interface';
+
+interface TreeExtrasProps {
+  pathPrefix?: string;
+}
+
+function _join(prefix: string | undefined, path: string): string {
+  return prefix ? `${prefix}.${path}` : path;
+}
 
 /**
  * RAPTOR-style knobs (summarization prompt + max_token + threshold).
@@ -17,9 +24,14 @@ import { CompilationTemplateFormValues } from '../interface';
  * pattern so the conditional rendering tree stays clean for other
  * kinds.
  */
-export function TreeExtras() {
-  const form = useFormContext<CompilationTemplateFormValues>();
+export function TreeExtras({ pathPrefix }: TreeExtrasProps) {
+  // Form context widened — same reason as in ArtifactExtras.
+  const form = useFormContext<any>();
   const { t } = useTranslation();
+
+  const promptPath = _join(pathPrefix, 'raptor.prompt');
+  const maxTokenPath = _join(pathPrefix, 'raptor.max_token');
+  const thresholdPath = _join(pathPrefix, 'raptor.threshold');
 
   return (
     <section className="space-y-3">
@@ -29,7 +41,7 @@ export function TreeExtras() {
 
       <FormField
         control={form.control}
-        name="raptor.prompt"
+        name={promptPath as any}
         render={({ field }) => (
           <FormItem>
             <FormLabel>{t('knowledgeCompilation.treePromptLabel')}</FormLabel>
@@ -49,7 +61,7 @@ export function TreeExtras() {
       <div className="grid grid-cols-2 gap-3">
         <FormField
           control={form.control}
-          name="raptor.max_token"
+          name={maxTokenPath as any}
           render={({ field }) => (
             <FormItem>
               <FormLabel>
@@ -73,7 +85,7 @@ export function TreeExtras() {
 
         <FormField
           control={form.control}
-          name="raptor.threshold"
+          name={thresholdPath as any}
           render={({ field }) => (
             <FormItem>
               <FormLabel>

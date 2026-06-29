@@ -1184,6 +1184,7 @@ class MCPServer(DataBaseModel):
 class CompilationTemplate(DataBaseModel):
     id = CharField(max_length=32, primary_key=True)
     tenant_id = CharField(max_length=32, null=True, index=True)
+    group_id = CharField(max_length=32, null=True, index=True)
     name = CharField(max_length=128, null=False, index=True)
     description = TextField(null=True, default="")
     kind = CharField(max_length=64, null=False, index=True)
@@ -1195,6 +1196,21 @@ class CompilationTemplate(DataBaseModel):
         db_table = "compilation_template"
         indexes = (
             (("tenant_id", "name", "is_builtin", "status"), True),
+        )
+
+
+class CompilationTemplateGroup(DataBaseModel):
+    id = CharField(max_length=32, primary_key=True)
+    tenant_id = CharField(max_length=32, null=False, index=True)
+    name = CharField(max_length=128, null=False, index=True)
+    description = TextField(null=True, default="")
+    scope = CharField(max_length=16, null=False, index=True, help_text="file | dataset")
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+
+    class Meta:
+        db_table = "compilation_template_group"
+        indexes = (
+            (("tenant_id", "name", "status"), True),
         )
 
 
@@ -1834,6 +1850,7 @@ def migrate_db():
     alter_db_column_type(migrator, "file", "size", BigIntegerField(default=0, index=True))
     alter_db_add_column(migrator, "tenant", "ocr_id", CharField(max_length=128, null=True, help_text="default ocr model ID", index=True))
     alter_db_column_type(migrator, "chat_channel", "status", IntegerField(default=1, index=True))
+    alter_db_add_column(migrator, "compilation_template", "group_id", CharField(max_length=32, null=True, help_text="parent compilation template group id", index=True))
     # Drop both the explicit "idx_*" name from later migrations AND the
     # Peewee-auto-derived "<table-as-classname>_<col1>_<col2>" name from the
     # original TenantModelInstance definition (commit dc4b82523). Databases

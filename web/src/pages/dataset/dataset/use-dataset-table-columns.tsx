@@ -88,10 +88,14 @@ export function useDatasetTableColumns({
       meta: { cellClassName: 'max-w-[20vw]' },
       cell: ({ row }) => {
         const name: string = row.getValue('name');
+        // Post template-group refactor a doc references a single
+        // group id (1 if set, 0 otherwise). The column UI still uses a
+        // count, so we coerce presence → 0/1.
         const compilationTemplateCount =
           row.original.compilation_template_count ??
-          row.original.parser_config?.compilation_template_ids?.length ??
-          0;
+          (row.original.parser_config?.compilation_template_group_id?.trim?.()
+            ? 1
+            : 0);
         const hasCompilationTemplate = compilationTemplateCount > 0;
 
         return (

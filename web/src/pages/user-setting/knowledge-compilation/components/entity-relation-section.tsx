@@ -42,6 +42,17 @@ interface EntityRelationSectionProps {
   variant: SectionVariant;
   kind: CompilationTemplateFormValues['kind'];
   fieldTemplates: FieldTemplateMap;
+  /**
+   * Optional dot-path that prefixes every form-field name this section
+   * registers (e.g. ``templates.0``). Lets the section render inside a
+   * group form whose schema nests ``templates: [child, child, ...]``.
+   * Default ``''`` keeps backward-compat with single-template forms.
+   */
+  pathPrefix?: string;
+}
+
+function _join(prefix: string | undefined, path: string): string {
+  return prefix ? `${prefix}.${path}` : path;
 }
 
 interface TypeComboboxProps {
@@ -144,13 +155,22 @@ function TypeCombobox({
 export function EntityRelationSection({
   variant,
   fieldTemplates,
+  pathPrefix,
 }: EntityRelationSectionProps) {
-  const form = useFormContext<CompilationTemplateFormValues>();
+  // ``any`` here lets the same section render under either:
+  //   - top-level paths (variant.fields.*)        — single-template form
+  //   - prefixed paths (templates.N.variant.*)    — template-group form
+  // RHF's name strings are validated against the form-value type, so we
+  // intentionally widen the form context.
+  const form = useFormContext<any>();
   const { t } = useTranslation();
+
+  const fieldsPath = _join(pathPrefix, `${variant}.fields`);
+  const descriptionPath = _join(pathPrefix, `${variant}.description`);
 
   const fieldArray = useFieldArray({
     control: form.control,
-    name: `${variant}.fields` as const,
+    name: fieldsPath as any,
   });
 
   const typeOptions =
@@ -163,16 +183,16 @@ export function EntityRelationSection({
         return;
       }
       form.setValue(
-        `${variant}.fields.${index}.description`,
+        `${fieldsPath}.${index}.description` as any,
         template.description,
         { shouldDirty: true, shouldValidate: true },
       );
-      form.setValue(`${variant}.fields.${index}.rule`, template.rule, {
+      form.setValue(`${fieldsPath}.${index}.rule` as any, template.rule, {
         shouldDirty: true,
         shouldValidate: true,
       });
     },
-    [fieldTemplates, form, variant],
+    [fieldTemplates, form, fieldsPath],
   );
 
   return (
@@ -185,7 +205,7 @@ export function EntityRelationSection({
 
       <FormField
         control={form.control}
-        name={`${variant}.description` as const}
+        name={descriptionPath as any}
         render={({ field }) => (
           <FormItem>
             <FormLabel>
@@ -221,7 +241,7 @@ export function EntityRelationSection({
           <div className="flex flex-col gap-3">
             <FormField
               control={form.control}
-              name={`${variant}.fields.${index}.type` as const}
+              name={`${fieldsPath}.${index}.type` as any}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel className="text-xs">
@@ -246,7 +266,7 @@ export function EntityRelationSection({
             />
             <FormField
               control={form.control}
-              name={`${variant}.fields.${index}.description` as const}
+              name={`${fieldsPath}.${index}.description` as any}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel className="text-xs">
@@ -267,7 +287,7 @@ export function EntityRelationSection({
             />
             <FormField
               control={form.control}
-              name={`${variant}.fields.${index}.rule` as const}
+              name={`${fieldsPath}.${index}.rule` as any}
               render={({ field }) => (
                 <FormItem>
                   <FormLabel className="text-xs">

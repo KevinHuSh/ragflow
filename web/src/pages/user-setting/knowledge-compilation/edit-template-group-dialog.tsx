@@ -15,34 +15,38 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import {
-  useCreateCompilationTemplate,
-  useFetchCompilationTemplate,
-  useListCompilationTemplates,
-  useUpdateCompilationTemplate,
+  useCreateCompilationTemplateGroup,
+  useFetchCompilationTemplateGroup,
+  useListCompilationTemplateGroups,
+  useUpdateCompilationTemplateGroup,
 } from '@/hooks/use-compilation-template-request';
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { EditTemplateForm } from './edit-template-form';
+import { EditTemplateGroupForm } from './edit-template-group-form';
 
-interface EditTemplateDialogProps {
+interface EditTemplateGroupDialogProps {
   id: string;
   hideModal: () => void;
 }
 
 /**
- * Wraps {@link EditTemplateForm} in a Dialog and wires create/update
- * mutations. The dialog stays open while the mutation is in-flight; on
- * success it closes and React Query invalidates the list.
+ * Modal wrapper around {@link EditTemplateGroupForm}. Drives the same
+ * create/update mutation pair as the previous per-template dialog;
+ * the only difference is the payload shape (group + embedded
+ * children).
  */
-export function EditTemplateDialog({ id, hideModal }: EditTemplateDialogProps) {
+export function EditTemplateGroupDialog({
+  id,
+  hideModal,
+}: EditTemplateGroupDialogProps) {
   const { t } = useTranslation();
   const { data: initial, loading: loadingInitial } =
-    useFetchCompilationTemplate(id);
-  const { createCompilationTemplate, loading: creating } =
-    useCreateCompilationTemplate();
-  const { updateCompilationTemplate, loading: updating } =
-    useUpdateCompilationTemplate();
-  const { data: savedTemplates } = useListCompilationTemplates();
+    useFetchCompilationTemplateGroup(id);
+  const { createCompilationTemplateGroup, loading: creating } =
+    useCreateCompilationTemplateGroup();
+  const { updateCompilationTemplateGroup, loading: updating } =
+    useUpdateCompilationTemplateGroup();
+  const { data: savedGroups } = useListCompilationTemplateGroups();
 
   const isEditing = Boolean(id);
   const loading = loadingInitial || creating || updating;
@@ -63,15 +67,14 @@ export function EditTemplateDialog({ id, hideModal }: EditTemplateDialogProps) {
   }, [hideModal]);
 
   const handleSubmit = useCallback(
-    async (values: {
+    async (payload: {
       name: string;
-      description?: string;
-      kind: any;
-      config: any;
+      description: string;
+      templates: any[];
     }) => {
       const code = isEditing
-        ? await updateCompilationTemplate({ id, ...values })
-        : await createCompilationTemplate(values);
+        ? await updateCompilationTemplateGroup({ id, ...payload })
+        : await createCompilationTemplateGroup(payload);
       if (code === 0) {
         setIsDirty(false);
         hideModal();
@@ -80,8 +83,8 @@ export function EditTemplateDialog({ id, hideModal }: EditTemplateDialogProps) {
     [
       isEditing,
       id,
-      updateCompilationTemplate,
-      createCompilationTemplate,
+      updateCompilationTemplateGroup,
+      createCompilationTemplateGroup,
       hideModal,
     ],
   );
@@ -93,21 +96,18 @@ export function EditTemplateDialog({ id, hideModal }: EditTemplateDialogProps) {
           <DialogHeader>
             <DialogTitle>
               {isEditing
-                ? t('knowledgeCompilation.editTemplate')
-                : t('knowledgeCompilation.addTemplate')}
+                ? t('knowledgeCompilation.editTemplateGroup')
+                : t('knowledgeCompilation.addTemplateGroup')}
             </DialogTitle>
           </DialogHeader>
-          {/* When opening for edit, wait for the initial fetch so RHF
-            defaultValues are populated correctly. For "add" we render
-            immediately with the empty defaults. */}
           {isEditing && loadingInitial ? (
             <p className="p-6 text-sm text-text-secondary">
               {t('common.loading')}
             </p>
           ) : (
-            <EditTemplateForm
+            <EditTemplateGroupForm
               initial={isEditing ? initial : undefined}
-              savedTemplates={savedTemplates.templates}
+              savedGroups={savedGroups.groups}
               onSubmit={handleSubmit}
               onCancel={requestClose}
               onDirtyChange={setIsDirty}

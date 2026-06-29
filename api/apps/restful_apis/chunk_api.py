@@ -546,6 +546,7 @@ async def get_document_structure_graph(tenant_id, dataset_id, document_id):
     """
     from rag.nlp import search
     from api.db.services.compilation_template_service import CompilationTemplateService
+    from api.db.services.compilation_template_group_service import CompilationTemplateGroupService
 
     if not KnowledgebaseService.accessible(kb_id=dataset_id, user_id=tenant_id):
         return get_error_data_result(message=f"You don't own the dataset {dataset_id}.")
@@ -556,23 +557,25 @@ async def get_document_structure_graph(tenant_id, dataset_id, document_id):
     if not docs:
         return get_error_data_result(message=f"You don't own the document {document_id}.")
 
-    # Resolve the doc's configured templates so we can render tabs in the
-    # same order the user picked them. Artifacts-kind templates render on
-    # the dataset Artifact tab, not here, so they're filtered out.
+    # Resolve the doc's configured template group → child template ids
+    # so we can render tabs in the order the user picked them.
+    # Artifacts-kind templates render on the dataset Artifact tab, not
+    # here, so they're filtered out.
     parser_config = docs[0].parser_config or {}
-    configured_ids: list[str] = []
+    group_id = ""
     if isinstance(parser_config, dict):
-        for candidate_loc in (parser_config, parser_config.get("ext") if isinstance(parser_config.get("ext"), dict) else None):
-            if not isinstance(candidate_loc, dict):
-                continue
-            ids = candidate_loc.get("compilation_template_ids")
-            if isinstance(ids, list):
-                for x in ids:
-                    if isinstance(x, str) and x.strip() and x.strip() not in configured_ids:
-                        configured_ids.append(x.strip())
-            legacy = candidate_loc.get("compilation_template_id")
-            if isinstance(legacy, str) and legacy.strip() and legacy.strip() not in configured_ids:
-                configured_ids.append(legacy.strip())
+        gid = parser_config.get("compilation_template_group_id")
+        if isinstance(gid, str) and gid.strip():
+            group_id = gid.strip()
+        elif isinstance(parser_config.get("ext"), dict):
+            gid = parser_config["ext"].get("compilation_template_group_id")
+            if isinstance(gid, str) and gid.strip():
+                group_id = gid.strip()
+    configured_ids: list[str] = (
+        CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id)
+        if group_id
+        else []
+    )
 
     # template_id → {name, kind, parser_kind_norm}
     template_meta: dict[str, dict] = {}

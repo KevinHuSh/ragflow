@@ -2,22 +2,23 @@ import { Button } from '@/components/ui/button';
 import { SearchInput } from '@/components/ui/input';
 import { RAGFlowPagination } from '@/components/ui/ragflow-pagination';
 import {
-  useDeleteCompilationTemplate,
-  useListCompilationTemplates,
+  useDeleteCompilationTemplateGroup,
+  useListCompilationTemplateGroups,
 } from '@/hooks/use-compilation-template-request';
 import { pick } from 'lodash';
 import { Plus } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ProfileSettingWrapperCard } from '../components/user-setting-header';
-import { EditTemplateDialog } from './edit-template-dialog';
-import { TemplateCardList } from './template-card';
+import { EditTemplateGroupDialog } from './edit-template-group-dialog';
+import { TemplateGroupCardList } from './template-card';
 
 export default function KnowledgeCompilation() {
   const { t } = useTranslation();
   const { data, setPagination, searchString, handleInputChange, pagination } =
-    useListCompilationTemplates();
-  const { deleteCompilationTemplate } = useDeleteCompilationTemplate();
+    useListCompilationTemplateGroups();
+  const { deleteCompilationTemplateGroup } =
+    useDeleteCompilationTemplateGroup();
 
   const [editVisible, setEditVisible] = useState(false);
   const [editingId, setEditingId] = useState<string>('');
@@ -42,9 +43,9 @@ export default function KnowledgeCompilation() {
 
   const handleDelete = useCallback(
     (id: string) => {
-      deleteCompilationTemplate([id]);
+      deleteCompilationTemplateGroup([id]);
     },
-    [deleteCompilationTemplate],
+    [deleteCompilationTemplateGroup],
   );
 
   const handlePageChange = useCallback(
@@ -81,10 +82,10 @@ export default function KnowledgeCompilation() {
       }
     >
       <div className="h-full p-5 overflow-x-hidden overflow-y-auto">
-        {data.templates?.length ? (
+        {data.groups?.length ? (
           <>
-            <TemplateCardList
-              items={data.templates}
+            <TemplateGroupCardList
+              items={data.groups}
               onEdit={handleEditFromCard}
               onDelete={handleDelete}
             />
@@ -106,7 +107,7 @@ export default function KnowledgeCompilation() {
       </div>
 
       {editVisible && (
-        <EditTemplateDialog hideModal={hideEdit} id={editingId} />
+        <EditTemplateGroupDialog hideModal={hideEdit} id={editingId} />
       )}
     </ProfileSettingWrapperCard>
   );

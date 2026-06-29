@@ -1,12 +1,12 @@
 import message from '@/components/ui/message';
 import {
   BuiltinCompilationTemplate,
-  CompilationTemplate,
-  CompilationTemplateListResponse,
+  CompilationTemplateGroup,
+  CompilationTemplateGroupListResponse,
 } from '@/interfaces/database/compilation-template';
 import {
-  ICreateCompilationTemplateRequest,
-  IUpdateCompilationTemplateRequest,
+  ICreateCompilationTemplateGroupRequest,
+  IUpdateCompilationTemplateGroupRequest,
 } from '@/interfaces/request/compilation-template';
 import i18n from '@/locales/config';
 import compilationTemplateService from '@/services/compilation-template-service';
@@ -18,40 +18,45 @@ import {
 } from './logic-hooks';
 
 /**
- * Query-key factory for the knowledge-compilation templates surface.
- * Every `useQuery` and `invalidateQueries` in this file (or anywhere else
- * that touches this data) must go through this factory — per the project's
- * mandatory query-key-factory rule.
+ * Query-key factory for the knowledge-compilation surface. Two domains
+ * coexist:
+ *   - ``group`` : the user-managed entity (CRUD, list, detail)
+ *   - ``builtin``: the read-only template palette used as pre-fill
+ *
+ * Every ``useQuery`` and ``invalidateQueries`` in this file (or anywhere
+ * else that touches this data) must go through this factory.
  */
 export const CompilationTemplateKeys = {
   all: () => ['compilation_template'] as const,
-  list: (filters: { search?: string; page?: number; pageSize?: number }) =>
-    ['compilation_template', 'list', filters] as const,
-  detail: (id: string) => ['compilation_template', 'detail', id] as const,
+  groups: () => ['compilation_template', 'group'] as const,
+  groupList: (filters: { search?: string; page?: number; pageSize?: number }) =>
+    ['compilation_template', 'group', 'list', filters] as const,
+  groupDetail: (id: string) =>
+    ['compilation_template', 'group', 'detail', id] as const,
   builtins: () => ['compilation_template', 'builtins'] as const,
 };
 
-export const useListCompilationTemplates = () => {
+export const useListCompilationTemplateGroups = () => {
   const { searchString, handleInputChange } = useHandleSearchChange();
   const { pagination, setPagination } = useGetPaginationWithRouter();
   const debouncedSearchString = useDebounce(searchString, { wait: 500 });
 
   const { data, isFetching: loading } =
-    useQuery<CompilationTemplateListResponse>({
-      queryKey: CompilationTemplateKeys.list({
+    useQuery<CompilationTemplateGroupListResponse>({
+      queryKey: CompilationTemplateKeys.groupList({
         search: debouncedSearchString,
         page: pagination.current,
         pageSize: pagination.pageSize,
       }),
-      initialData: { total: 0, templates: [] },
+      initialData: { total: 0, groups: [] },
       gcTime: 0,
       queryFn: async () => {
-        const { data } = await compilationTemplateService.list({
+        const { data } = await compilationTemplateService.listGroups({
           keywords: debouncedSearchString,
           page: pagination.current,
           page_size: pagination.pageSize,
         });
-        return data?.data ?? { total: 0, templates: [] };
+        return data?.data ?? { total: 0, groups: [] };
       },
     });
 
@@ -65,38 +70,43 @@ export const useListCompilationTemplates = () => {
   };
 };
 
-export const useFetchSavedCompilationTemplates = () => {
+/**
+ * Fetch *all* saved groups for the tenant — used by the dataset
+ * parser-config picker and anywhere else that needs the full list
+ * without paging.
+ */
+export const useFetchSavedCompilationTemplateGroups = () => {
   const { data, isFetching: loading } =
-    useQuery<CompilationTemplateListResponse>({
-      queryKey: CompilationTemplateKeys.list({
+    useQuery<CompilationTemplateGroupListResponse>({
+      queryKey: CompilationTemplateKeys.groupList({
         search: '',
         page: 1,
         pageSize: 100,
       }),
-      initialData: { total: 0, templates: [] },
+      initialData: { total: 0, groups: [] },
       queryFn: async () => {
-        const { data } = await compilationTemplateService.list({
+        const { data } = await compilationTemplateService.listGroups({
           keywords: '',
           page: 1,
           page_size: 100,
         });
-        return data?.data ?? { total: 0, templates: [] };
+        return data?.data ?? { total: 0, groups: [] };
       },
     });
 
   return { data, loading };
 };
 
-export const useFetchCompilationTemplate = (id: string) => {
+export const useFetchCompilationTemplateGroup = (id: string) => {
   const { data, isFetching: loading } = useQuery<
-    CompilationTemplate | undefined
+    CompilationTemplateGroup | undefined
   >({
-    queryKey: CompilationTemplateKeys.detail(id),
+    queryKey: CompilationTemplateKeys.groupDetail(id),
     initialData: undefined,
     gcTime: 0,
     enabled: !!id,
     queryFn: async () => {
-      const { data } = await compilationTemplateService.get({ id });
+      const { data } = await compilationTemplateService.getGroup({ id });
       return data?.data;
     },
   });
@@ -128,75 +138,77 @@ export const useFetchBuiltinCompilationTemplates = () => {
   return { data: data ?? [], loading: isLoading || isFetching, refetch };
 };
 
-export const useCreateCompilationTemplate = () => {
+export const useCreateCompilationTemplateGroup = () => {
   const queryClient = useQueryClient();
   const {
     data,
     isPending: loading,
     mutateAsync,
   } = useMutation({
-    mutationKey: ['createCompilationTemplate'],
-    mutationFn: async (params: ICreateCompilationTemplateRequest) => {
-      const { data = {} } = await compilationTemplateService.create(params);
+    mutationKey: ['createCompilationTemplateGroup'],
+    mutationFn: async (params: ICreateCompilationTemplateGroupRequest) => {
+      const { data = {} } =
+        await compilationTemplateService.createGroup(params);
       if (data.code === 0) {
         message.success(i18n.t('message.created'));
         queryClient.invalidateQueries({
-          queryKey: CompilationTemplateKeys.all(),
+          queryKey: CompilationTemplateKeys.groups(),
         });
       }
       return data.code;
     },
   });
 
-  return { data, loading, createCompilationTemplate: mutateAsync };
+  return { data, loading, createCompilationTemplateGroup: mutateAsync };
 };
 
-export const useUpdateCompilationTemplate = () => {
+export const useUpdateCompilationTemplateGroup = () => {
   const queryClient = useQueryClient();
   const {
     data,
     isPending: loading,
     mutateAsync,
   } = useMutation({
-    mutationKey: ['updateCompilationTemplate'],
-    mutationFn: async (params: IUpdateCompilationTemplateRequest) => {
-      const { data = {} } = await compilationTemplateService.update(params);
+    mutationKey: ['updateCompilationTemplateGroup'],
+    mutationFn: async (params: IUpdateCompilationTemplateGroupRequest) => {
+      const { data = {} } =
+        await compilationTemplateService.updateGroup(params);
       if (data.code === 0) {
         message.success(i18n.t('message.updated'));
         queryClient.invalidateQueries({
-          queryKey: CompilationTemplateKeys.all(),
+          queryKey: CompilationTemplateKeys.groups(),
         });
       }
       return data.code;
     },
   });
 
-  return { data, loading, updateCompilationTemplate: mutateAsync };
+  return { data, loading, updateCompilationTemplateGroup: mutateAsync };
 };
 
-export const useDeleteCompilationTemplate = () => {
+export const useDeleteCompilationTemplateGroup = () => {
   const queryClient = useQueryClient();
   const {
     data,
     isPending: loading,
     mutateAsync,
   } = useMutation({
-    mutationKey: ['deleteCompilationTemplate'],
+    mutationKey: ['deleteCompilationTemplateGroup'],
     mutationFn: async (ids: string[]) => {
       const results = await Promise.all(
-        ids.map((id) => compilationTemplateService.delete({ id })),
+        ids.map((id) => compilationTemplateService.deleteGroup({ id })),
       );
       const failed = results.find(({ data = {} }) => data.code !== 0);
       const data = failed?.data ?? { code: 0, data: true };
       if (!failed) {
         message.success(i18n.t('message.deleted'));
         queryClient.invalidateQueries({
-          queryKey: CompilationTemplateKeys.all(),
+          queryKey: CompilationTemplateKeys.groups(),
         });
       }
       return data;
     },
   });
 
-  return { data, loading, deleteCompilationTemplate: mutateAsync };
+  return { data, loading, deleteCompilationTemplateGroup: mutateAsync };
 };

@@ -85,7 +85,9 @@ function addUniqueTypeIssue(
 
 export const compilationTemplateFormSchema = z
   .object({
-    name: z.string().trim().min(1, 'Template name is required.').max(128),
+    // ``name`` is no longer part of the per-child form — children
+    // inside a template group are identified by (kind, index) and the
+    // backend derives a placeholder name when persisting.
     description: z.string().max(TEXT_MAX).optional().default(''),
     kind: z.enum(
       COMPILATION_TEMPLATE_KINDS as readonly [
@@ -188,12 +190,10 @@ export type CompilationTemplateFormValues = z.infer<
  * for nicer RHF defaults) is one edit.
  */
 export function templateConfigToFormValues(
-  name: string,
   description: string | undefined,
   config: CompilationTemplateConfig,
 ): CompilationTemplateFormValues {
   return {
-    name,
     description: description ?? '',
     kind: config.kind,
     // ``llm_id`` is required on save; when the stored config predates the
@@ -300,7 +300,6 @@ export function formValuesToTemplateConfig(
  */
 export function emptyFormValues(): CompilationTemplateFormValues {
   return {
-    name: '',
     description: '',
     kind: 'empty',
     // Seeded later by the form's defaultModelDict useEffect once the

@@ -30,6 +30,35 @@ class CompilationTemplateService(CommonService):
     model = CompilationTemplate
 
     @classmethod
+    def fill_config_default_llm(cls, config: dict, tenant_id: str | None) -> dict:
+        if not isinstance(config, dict) or config.get("llm_id") or not tenant_id:
+            return config
+        try:
+            from api.db.services.user_service import TenantService
+
+            ok, tenant = TenantService.get_by_id(tenant_id)
+            if ok and getattr(tenant, "llm_id", None):
+                config = dict(config)
+                config["llm_id"] = tenant.llm_id
+        except Exception:
+            logging.exception(
+                "compilation_template: llm_id default-fill lookup failed for tenant=%s",
+                tenant_id,
+            )
+        return config
+
+    @classmethod
+    def fill_default_llm_for_templates(cls, templates: list[dict], tenant_id: str | None) -> list[dict]:
+        if not tenant_id:
+            return templates
+        filled = []
+        for template in templates:
+            item = dict(template)
+            item["config"] = cls.fill_config_default_llm(item.get("config") or {}, tenant_id)
+            filled.append(item)
+        return filled
+
+    @classmethod
     def _sort_builtins(cls, templates: list[dict]) -> list[dict]:
         return sorted(
             templates,
@@ -74,7 +103,7 @@ class CompilationTemplateService(CommonService):
             "name": data["name"],
             "description": data.get("description") or "",
             "kind": data["kind"],
-            "config": config,
+            "config": cls.fill_config_default_llm(config, data.get("tenant_id")),
             "create_time": data.get("create_time"),
             "update_time": data.get("update_time"),
         }

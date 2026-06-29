@@ -295,16 +295,16 @@ export default {
     `${restAPIv1}/mcp/servers/${id}?mode=download`,
   testMcpServer: (id: string) => `${restAPIv1}/mcp/servers/${id}/test`,
 
-  // knowledge compilation templates
-  listCompilationTemplates: `${restAPIv1}/compilation_templates`,
-  getCompilationTemplate: (id: string) =>
-    `${restAPIv1}/compilation_templates/${id}`,
-  createCompilationTemplate: `${restAPIv1}/compilation_templates`,
-  updateCompilationTemplate: (id: string) =>
-    `${restAPIv1}/compilation_templates/${id}`,
-  deleteCompilationTemplate: (id: string) =>
-    `${restAPIv1}/compilation_templates/${id}`,
+  // knowledge compilation templates (builtins palette + groups CRUD)
   listBuiltinCompilationTemplates: `${restAPIv1}/compilation_templates/builtins`,
+  listCompilationTemplateGroups: `${restAPIv1}/compilation_template_groups`,
+  getCompilationTemplateGroup: (id: string) =>
+    `${restAPIv1}/compilation_template_groups/${id}`,
+  createCompilationTemplateGroup: `${restAPIv1}/compilation_template_groups`,
+  updateCompilationTemplateGroup: (id: string) =>
+    `${restAPIv1}/compilation_template_groups/${id}`,
+  deleteCompilationTemplateGroup: (id: string) =>
+    `${restAPIv1}/compilation_template_groups/${id}`,
 
   // dataset artifact (knowledge compilation pages)
   hasAnyArtifact: (datasetId: string) =>
