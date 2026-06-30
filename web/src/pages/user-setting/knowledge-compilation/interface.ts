@@ -127,6 +127,9 @@ export const compilationTemplateFormSchema = z
         prompt: z.string().max(TEXT_MAX),
         max_token: z.coerce.number().int().min(1).max(8192),
         threshold: z.coerce.number().min(0).max(1),
+        // Soft-deletes originals + inserts merged replacement chunks
+        // per leaf cluster when enabled. Default off.
+        rechunk: z.boolean().optional().default(false),
       })
       .optional(),
     global_rules: z.string().max(GLOBAL_RULES_MAX),
@@ -266,6 +269,7 @@ export function templateConfigToFormValues(
               'Please write a concise summary of the following texts:\n{cluster_content}',
             max_token: config.raptor?.max_token ?? 512,
             threshold: config.raptor?.threshold ?? 0.1,
+            rechunk: config.raptor?.rechunk ?? false,
           }
         : undefined,
     global_rules: config.global_rules ?? '',
@@ -332,6 +336,7 @@ export const ENTITY_TYPE_SUGGESTIONS: Record<
   page_index: [],
   timeline: [],
   knowledge_graph: [],
+  mind_map: [],
   artifacts: [],
   tree: [],
   empty: [],
@@ -344,6 +349,7 @@ export const RELATION_TYPE_SUGGESTIONS: Record<
   page_index: [],
   timeline: [],
   knowledge_graph: [],
+  mind_map: [],
   artifacts: [],
   tree: [],
   empty: [],

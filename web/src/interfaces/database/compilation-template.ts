@@ -11,6 +11,7 @@ export const COMPILATION_TEMPLATE_KINDS = [
   'page_index',
   'timeline',
   'knowledge_graph',
+  'mind_map',
   'artifacts',
   'tree',
   'empty',
@@ -86,6 +87,12 @@ export interface CompilationRaptorSection {
   prompt: string;
   max_token: number;
   threshold: number;
+  /** When true, after the tree compiles, leaf-cluster source chunks
+   *  are merged into a single replacement chunk per cluster and the
+   *  originals are marked unavailable (``available_int=0``) in ES.
+   *  Defaults to false. Only one ``tree``-kind template per group may
+   *  enable this; the group editor enforces the invariant. */
+  rechunk?: boolean;
 }
 
 export interface CompilationTemplate {

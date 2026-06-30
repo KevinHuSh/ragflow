@@ -1189,6 +1189,28 @@ class TaskHandler:
                 )
                 continue
 
+            # Optional re-chunking pass: if the template enables
+            # ``raptor.rechunk``, merge each leaf cluster's source
+            # chunks into a single replacement chunk and rewrite the
+            # tree's source_chunk_ids in-place so the projected graph
+            # below reflects the new IDs. Originals are soft-deleted
+            # via ``available_int=0``. Failures here are logged but
+            # don't block the graph upsert — the tree still represents
+            # the original chunks in that case.
+            if bool((raptor_cfg or {}).get("rechunk")):
+                try:
+                    await self._rechunk_doc_by_tree(
+                        tree=tree,
+                        template_id=template_id,
+                        embedding_model=embedding_model,
+                    )
+                except Exception:
+                    logging.exception(
+                        "tree-template %s: re-chunking failed for doc %s; "
+                        "persisting tree with original chunk ids",
+                        template_id, doc_id,
+                    )
+
             graph = self._raptor_tree_to_graph(tree)
             try:
                 await _struct_upsert_graph_json(
@@ -1266,6 +1288,250 @@ class TaskHandler:
                 break
             offset += PAGE
         return out
+
+    async def _rechunk_doc_by_tree(
+        self,
+        tree: dict,
+        template_id: str,
+        embedding_model,
+    ) -> None:
+        """Merge each leaf cluster's source chunks into a single
+        replacement chunk and rewrite the tree's leaf-cluster
+        ``source_chunk_ids`` in-place.
+
+        A *leaf cluster* is an internal tree node whose every child is
+        a terminal node (i.e., the lowest-level summary node in the
+        RAPTOR tree, one level above the original-chunk leaves). For
+        each such cluster:
+
+        1. The source chunks are fetched from ES (only ``available_int=1``
+           rows, so re-runs over already-rechunked state are no-ops).
+        2. Chunks are sorted by ``(min(page_num_int), min(top_int))``
+           with the chunk id as a stable tiebreaker.
+        3. ``content_with_weight`` is concatenated with a blank line
+           separator; ``page_num_int`` and ``top_int`` are union'd so
+           the merged chunk still resolves positionally to its source
+           pages.
+        4. A fresh embedding is computed on the merged content
+           (re-embed strategy — averaging source vectors was rejected
+           in the spec because retrieval recall on the merged chunk
+           would degrade).
+        5. The merged chunk is inserted, the leaf cluster's
+           ``source_chunk_ids`` (and those of its terminal children)
+           are rewritten to ``[merged_chunk_id]`` so the persisted
+           tree graph stays in sync.
+        6. The original chunks are soft-deleted via
+           ``available_int=0`` and stamped with
+           ``superseded_by_chunk_id`` for traceability.
+
+        On any per-cluster failure the cluster is left unchanged and
+        the rest of the pass continues — the upsert path then writes
+        a mixed tree where rechunked clusters have a single new id and
+        un-rechunked clusters keep their originals.
+        """
+        from datetime import datetime
+        from common.misc_utils import get_uuid
+        from rag.nlp import rag_tokenizer
+
+        ctx = self._task_context
+
+        # --- 1. Collect leaf clusters --------------------------------
+        # ``cluster_id_map`` keys the cluster by ``id(node)``; we store
+        # the dict reference so we can rewrite ``source_chunk_ids``
+        # in-place once we have a merged_chunk_id.
+        cluster_id_map: dict[int, tuple[dict, list[str]]] = {}
+
+        def _is_terminal(node: object) -> bool:
+            return isinstance(node, dict) and not (node.get("children") or [])
+
+        def _walk(node: object) -> None:
+            if not isinstance(node, dict):
+                return
+            children = node.get("children") or []
+            if children and all(_is_terminal(c) for c in children):
+                src_ids: list[str] = []
+                seen: set[str] = set()
+                for c in children:
+                    for cid in (c.get("source_chunk_ids") or []):
+                        if isinstance(cid, str) and cid and cid not in seen:
+                            seen.add(cid)
+                            src_ids.append(cid)
+                for cid in (node.get("source_chunk_ids") or []):
+                    if isinstance(cid, str) and cid and cid not in seen:
+                        seen.add(cid)
+                        src_ids.append(cid)
+                if src_ids:
+                    cluster_id_map[id(node)] = (node, src_ids)
+            else:
+                for c in children:
+                    _walk(c)
+
+        _walk(tree)
+        if not cluster_id_map:
+            return
+
+        all_source_ids = sorted({sid for _, ids in cluster_id_map.values() for sid in ids})
+
+        # --- 2. Fetch source chunks ----------------------------------
+        from common.doc_store.doc_store_base import OrderByExpr
+
+        index_nm = search.index_name(ctx.tenant_id)
+        if not settings.docStoreConn.index_exist(index_nm, ctx.kb_id):
+            return
+
+        # Vector field dim matches the embedding model in use. Mirrors
+        # the lookup ``_run_tree_templates`` already does upstream.
+        vctr_nm = "q_%d_vec" % len(embedding_model.encode(["x"])[0][0])
+        select_fields = [
+            "id", "doc_id", "kb_id", "content_with_weight",
+            "page_num_int", "top_int", "position_int",
+            "docnm_kwd", "title_tks", "title_sm_tks",
+            "available_int",
+        ]
+        try:
+            res = await thread_pool_exec(
+                settings.docStoreConn.search,
+                select_fields, [],
+                {"id": all_source_ids, "available_int": 1},
+                [], OrderByExpr(), 0, len(all_source_ids) + 16,
+                index_nm, [ctx.kb_id],
+            )
+            field_map = settings.docStoreConn.get_fields(res, select_fields)
+        except Exception:
+            logging.exception(
+                "rechunk: failed to load source chunks for doc=%s template=%s",
+                ctx.doc_id, template_id,
+            )
+            return
+        if not field_map:
+            return
+
+        chunks_by_id: dict[str, dict] = {
+            str(rid): {**row, "id": str(rid)} for rid, row in field_map.items()
+        }
+
+        # --- 3. Build per-cluster merged chunks ----------------------
+        merged_rows: list[dict] = []
+        # Map ``id(cluster_node) -> new_chunk_id`` so step 5 can rewrite
+        # the tree in one pass after embeddings land.
+        cluster_new_id: dict[int, str] = {}
+
+        for node_id_int, (node, src_ids) in cluster_id_map.items():
+            cluster_chunks = [chunks_by_id[c] for c in src_ids if c in chunks_by_id]
+            if not cluster_chunks:
+                continue
+
+            def _sort_key(c: dict) -> tuple:
+                pages = c.get("page_num_int") or [0]
+                tops = c.get("top_int") or [0]
+                return (
+                    min(pages) if pages else 0,
+                    min(tops) if tops else 0,
+                    c.get("id") or "",
+                )
+            cluster_chunks.sort(key=_sort_key)
+
+            merged_content = "\n\n".join(
+                (c.get("content_with_weight") or "") for c in cluster_chunks
+            ).strip()
+            if not merged_content:
+                continue
+            page_union = sorted({
+                p for c in cluster_chunks for p in (c.get("page_num_int") or [])
+            })
+            top_union = sorted({
+                t for c in cluster_chunks for t in (c.get("top_int") or [])
+            })
+
+            # Re-use a source chunk as the template for kb/doc/tenant
+            # metadata so we don't have to enumerate every ES field.
+            base = dict(cluster_chunks[0])
+            new_id = get_uuid()
+            cluster_new_id[node_id_int] = new_id
+
+            base.update({
+                "id": new_id,
+                "content_with_weight": merged_content,
+                "content_ltks": rag_tokenizer.tokenize(merged_content),
+                "page_num_int": page_union,
+                "top_int": top_union,
+                "available_int": 1,
+                "rechunk_kwd": "tree",
+                "rechunked_from_template_id": template_id,
+                "rechunked_from_chunk_ids": [c.get("id") for c in cluster_chunks if c.get("id")],
+                "token_num": num_tokens_from_string(merged_content),
+                "create_time": str(datetime.now()).replace("T", " ")[:19],
+                "create_timestamp_flt": datetime.now().timestamp(),
+            })
+            base["content_sm_ltks"] = rag_tokenizer.fine_grained_tokenize(base["content_ltks"])
+            merged_rows.append(base)
+
+        if not merged_rows:
+            return
+
+        # --- 4. Embed merged content (re-embed strategy) -------------
+        contents = [r["content_with_weight"] for r in merged_rows]
+        try:
+            vectors, _ = embedding_model.encode(contents)
+        except Exception:
+            logging.exception(
+                "rechunk: embedding failed for doc=%s template=%s",
+                ctx.doc_id, template_id,
+            )
+            return
+        for row, vec in zip(merged_rows, vectors):
+            try:
+                row[vctr_nm] = np.asarray(vec, dtype=np.float32).tolist()
+            except Exception:
+                logging.exception("rechunk: vector cast failed; skipping row %s", row.get("id"))
+                row[vctr_nm] = None
+        merged_rows = [r for r in merged_rows if r.get(vctr_nm) is not None]
+        if not merged_rows:
+            return
+
+        # --- 5. Insert merged, rewrite tree, soft-delete originals ---
+        try:
+            await thread_pool_exec(
+                settings.docStoreConn.insert, merged_rows, index_nm, ctx.kb_id,
+            )
+        except Exception:
+            logging.exception(
+                "rechunk: insert failed for doc=%s template=%s",
+                ctx.doc_id, template_id,
+            )
+            return
+
+        # Rewrite source_chunk_ids on each affected cluster node and
+        # its terminal children. Done after insert so a failure above
+        # leaves the tree pointing at the still-active originals.
+        for node_id_int, new_chunk_id in cluster_new_id.items():
+            node, _ = cluster_id_map[node_id_int]
+            node["source_chunk_ids"] = [new_chunk_id]
+            for child in (node.get("children") or []):
+                if isinstance(child, dict):
+                    child["source_chunk_ids"] = [new_chunk_id]
+
+        # Soft-delete each source chunk; record the merged id for
+        # traceability so audit queries can still tell what replaced it.
+        for node_id_int, new_chunk_id in cluster_new_id.items():
+            _, src_ids = cluster_id_map[node_id_int]
+            for cid in src_ids:
+                try:
+                    await thread_pool_exec(
+                        settings.docStoreConn.update,
+                        {"id": cid},
+                        {
+                            "available_int": 0,
+                            "superseded_by_chunk_id": new_chunk_id,
+                        },
+                        index_nm,
+                        ctx.kb_id,
+                    )
+                except Exception:
+                    logging.exception(
+                        "rechunk: soft-delete failed for chunk=%s (merged=%s)",
+                        cid, new_chunk_id,
+                    )
 
     async def _run_artifact(self, embedding_model):
         """KB-wide artifact compilation task. Runs after the user clicks the

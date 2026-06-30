@@ -40,6 +40,20 @@ export const compilationTemplateGroupFormSchema = z
         path: ['templates'],
       });
     }
+    // At most one tree-kind child may enable re-chunking — multiple
+    // would race on the same source chunks during the soft-delete pass.
+    // Mirrors the backend invariant in
+    // ``_enforce_single_rechunk_tree``.
+    const rechunkTrees = values.templates.filter(
+      (t) => t.kind === 'tree' && t.raptor?.rechunk === true,
+    );
+    if (rechunkTrees.length > 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Only one tree template in a group may enable re-chunking.',
+        path: ['templates'],
+      });
+    }
     // Children are no longer named — uniqueness is implicit in their
     // (kind, index) tuple, and the group as a whole carries the
     // human-facing name.

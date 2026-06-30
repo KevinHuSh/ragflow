@@ -3012,6 +3012,9 @@ Important structured information may include: names, dates, locations, events, k
         'Use {{cluster_content}} as the placeholder for the texts to summarize.',
       treeMaxTokenLabel: 'Max token',
       treeThresholdLabel: 'Threshold',
+      rechunkLabel: 'Re-chunk by tree leaves',
+      rechunkDescription:
+        "Merge each leaf cluster's source chunks into a single replacement chunk. Originals are kept but marked unavailable for retrieval. Only one tree template per group may enable this.",
       editorTab: 'Editor',
       rawJsonTab: 'Raw JSON',
       addTemplate: 'Add template',
@@ -3068,6 +3071,7 @@ Important structured information may include: names, dates, locations, events, k
         page_index: 'PageIndex',
         timeline: 'Timeline',
         knowledge_graph: 'Knowledge graph',
+        mind_map: 'MIND MAP',
         artifacts: 'Artifacts',
         tree: 'Tree',
         empty: 'Empty',

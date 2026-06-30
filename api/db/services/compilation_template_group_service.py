@@ -48,7 +48,33 @@ def _derive_scope(templates: list[dict]) -> str:
                 "An artifacts template cannot be combined with other templates in the same group."
             )
         return SCOPE_DATASET
+
+    _enforce_single_rechunk_tree(templates)
     return SCOPE_FILE
+
+
+def _enforce_single_rechunk_tree(templates: list[dict]) -> None:
+    """At most one tree-kind child in the group may enable re-chunking.
+
+    Re-chunking soft-deletes the doc's original chunks via
+    ``available_int=0`` and inserts merged replacements; running two
+    such templates would race on the same source chunks and produce
+    non-deterministic output. Per-tenant invariant is enforced
+    server-side here and mirrored client-side in
+    ``group-interface.ts``.
+    """
+    rechunk_trees = 0
+    for t in templates:
+        if str((t or {}).get("kind") or "").strip() != "tree":
+            continue
+        cfg = (t or {}).get("config") or {}
+        raptor = (cfg or {}).get("raptor") or {}
+        if bool(raptor.get("rechunk")):
+            rechunk_trees += 1
+    if rechunk_trees > 1:
+        raise GroupValidationError(
+            "Only one tree template in a group may enable re-chunking."
+        )
 
 
 class CompilationTemplateGroupService(CommonService):
