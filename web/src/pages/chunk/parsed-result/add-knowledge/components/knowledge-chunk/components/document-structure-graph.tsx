@@ -13,6 +13,7 @@ import TimelineGraph from '@/pages/dataset/knowledge-graph/timeline-graph';
 import TreeGraph from '@/pages/dataset/knowledge-graph/tree-graph';
 import { Trash2, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import MindMapGraph from './mind-map-graph';
 
 /**
  * Normalize a template's ``kind`` string. The backend stamps a few
@@ -236,6 +237,120 @@ function toTimelineShape(template: IDocumentStructureTemplate | undefined): {
   return { nodes, edges };
 }
 
+/**
+ * Project a ``mind_map`` template onto G6's native mindmap layout.
+ * Parent-child labels are used directly; ``supports`` is reversed because
+ * the template defines it as supporting item -> supported concept while the
+ * tree renderer needs parent concept -> supporting detail.
+ */
+function toMindMapShape(template: IDocumentStructureTemplate | undefined): {
+  nodes: any[];
+  edges: any[];
+  rootId?: string;
+} {
+  if (!template) return { nodes: [], edges: [] };
+  const entities = Array.isArray(template.entities) ? template.entities : [];
+  const relations = Array.isArray(template.relations) ? template.relations : [];
+
+  const seenIds = new Set<string>();
+  const nodes: any[] = [];
+  for (const entity of entities) {
+    const id = (entity.name ?? '').trim();
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    const type = normalizeKind(entity.type);
+    nodes.push({
+      id,
+      entity_type: entity.type || 'branch',
+      isRoot: type === 'central_topic' || type === 'root',
+      description:
+        entity.discription || entity.description || entity.aliases?.join(', '),
+    });
+  }
+
+  const known = seenIds;
+  const parentEdgeTypes = new Set(['has_branch', 'has_sub_branch', 'include']);
+  const rawEdges: { source: string; target: string; description?: string }[] =
+    [];
+  for (const relation of relations) {
+    const relationType = normalizeKind(relation.type);
+    const edge =
+      relationType === 'supports'
+        ? {
+            source: relation.to,
+            target: relation.from,
+            description: relation.type,
+          }
+        : parentEdgeTypes.has(relationType)
+          ? {
+              source: relation.from,
+              target: relation.to,
+              description: relation.type,
+            }
+          : undefined;
+
+    if (
+      edge &&
+      edge.source !== edge.target &&
+      known.has(edge.source) &&
+      known.has(edge.target)
+    ) {
+      rawEdges.push(edge);
+    }
+  }
+
+  const hasParent = new Set<string>();
+  const childMap = new Map<string, string[]>();
+  const edges: typeof rawEdges = [];
+  const reaches = (start: string, target: string) => {
+    const stack = [...(childMap.get(start) ?? [])];
+    const visited = new Set<string>();
+    while (stack.length) {
+      const current = stack.pop()!;
+      if (current === target) return true;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      stack.push(...(childMap.get(current) ?? []));
+    }
+    return false;
+  };
+
+  for (const edge of rawEdges) {
+    if (hasParent.has(edge.target)) continue;
+    if (reaches(edge.target, edge.source)) continue;
+    edges.push(edge);
+    hasParent.add(edge.target);
+    if (!childMap.has(edge.source)) childMap.set(edge.source, []);
+    childMap.get(edge.source)!.push(edge.target);
+  }
+
+  const explicitRoot = nodes.find((node) => node.isRoot)?.id;
+  const rootId =
+    explicitRoot ||
+    nodes.find((node) => !hasParent.has(node.id))?.id ||
+    nodes[0]?.id;
+
+  let finalEdges = edges;
+  if (rootId) {
+    finalEdges = edges.filter((edge) => edge.target !== rootId);
+    const finalHasParent = new Set(finalEdges.map((edge) => edge.target));
+    for (const node of nodes) {
+      node.isRoot = node.id === rootId;
+    }
+    for (const node of nodes) {
+      if (node.id === rootId || finalHasParent.has(node.id)) continue;
+      finalEdges.push({
+        source: rootId,
+        target: node.id,
+        description: 'branch',
+      });
+      finalHasParent.add(node.id);
+    }
+  }
+
+  return { nodes, edges: finalEdges, rootId };
+}
+
 export function DocumentStructureGraph({
   data,
   loading,
@@ -290,7 +405,7 @@ export function DocumentStructureGraph({
    *                                  they read the same way visually.
    *   anything else                → force-directed
    */
-  type Renderer = 'tree' | 'timeline' | 'force';
+  type Renderer = 'tree' | 'timeline' | 'mind_map' | 'force';
   // ``tree`` kind ships as RAPTOR's hierarchical output; treat it the
   // same as the synthetic ``raptor`` kind / classic page_index — they
   // all read as a vertical hierarchy under one synthetic root, so they
@@ -298,6 +413,7 @@ export function DocumentStructureGraph({
 
   const renderer: Renderer = useMemo(() => {
     const k = normalizeKind(activeTemplate?.kind);
+    if (k === 'mind_map' || k === 'mindmap') return 'mind_map';
     if (k === 'page_index' || k === 'raptor' || k === 'tree') return 'tree';
     if (k === 'timeline' || k === 'list') return 'timeline';
     return 'force';
@@ -324,6 +440,13 @@ export function DocumentStructureGraph({
         : { nodes: [], edges: [] },
     [activeTemplate, renderer],
   );
+  const mindMapGraphData = useMemo(
+    () =>
+      renderer === 'mind_map'
+        ? toMindMapShape(activeTemplate)
+        : { nodes: [], edges: [], rootId: undefined },
+    [activeTemplate, renderer],
+  );
 
   const hasAny = nonEmptyTemplates.length > 0;
   const isEmpty = !loading && !hasAny;
@@ -332,7 +455,9 @@ export function DocumentStructureGraph({
       ? treeGraphData.nodes.length
       : renderer === 'timeline'
         ? timelineGraphData.nodes.length
-        : forceGraphData.nodes.length;
+        : renderer === 'mind_map'
+          ? mindMapGraphData.nodes.length
+          : forceGraphData.nodes.length;
   const { deleteStructureGraph, loading: deleting } =
     useDeleteDocumentStructureGraph();
   const showDeleteConfirm = useShowDeleteConfirm();
@@ -430,6 +555,12 @@ export function DocumentStructureGraph({
             <TreeGraph data={treeGraphData} show />
           ) : renderer === 'timeline' ? (
             <TimelineGraph data={timelineGraphData} show />
+          ) : renderer === 'mind_map' ? (
+            <MindMapGraph
+              data={mindMapGraphData}
+              rootId={mindMapGraphData.rootId}
+              show
+            />
           ) : (
             <ForceGraph data={forceGraphData} show />
           )
