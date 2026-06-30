@@ -1115,7 +1115,7 @@ class TaskHandler:
             ent: dict = {
                 "name": node_id,
                 "type": "tree_node",
-                "description": title,
+                "description": node.get("description", title),
                 "mention_count": 1,
             }
             src_ids = node.get("source_chunk_ids")
@@ -1490,6 +1490,8 @@ class TaskHandler:
             # metadata so we don't have to enumerate every ES field.
             base = dict(cluster_chunks[0])
             new_id = get_uuid()
+            new_id = xxhash.xxh64(
+            f"skill:{kb_id_str}:{node.folder_name}".encode("utf-8", "surrogatepass")).hexdigest()
             cluster_new_id[node_id_int] = new_id
 
             base.update({

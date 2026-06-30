@@ -895,7 +895,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
     def _materialize_tree(chunks, layers, parent_child_map, n_originals):
         """Walk ``parent_child_map`` from the top layer down to layer-1
         and emit the user-facing tree dict. See ``__call__``'s
-        ``is_tree=True`` contract for the shape."""
+        ``is_tree=True`` contract for the shape.
+        chunks: [(summary_text, summary_vec, merged_ids, summary_ti)]"""
         if not layers or len(chunks) == 0:
             return None
         top_start, top_end = layers[-1]
@@ -908,6 +909,9 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
             # and don't appear as tree nodes themselves (they collapse
             # into source_chunk_ids on their layer-1 parent).
             return chunks[idx][3] if len(chunks[idx]) >= 4 else ""
+        
+        def _desc_at(idx: int) -> str:
+            return chunks[idx][0] if chunks[idx] else ""
 
         def _build_node(idx: int) -> dict:
             children_idx = parent_child_map.get(idx, [])
@@ -922,10 +926,11 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                         if s and s not in seen:
                             seen.add(s)
                             ids.append(s)
-                return {"title": _title_at(idx), "source_chunk_ids": ids}
+                return {"title": _title_at(idx), "source_chunk_ids": ids, "description": _desc_at(idx)}
             return {
                 "children": [_build_node(c) for c in children_idx],
                 "title": _title_at(idx),
+                "description":  _desc_at(idx)
             }
 
         top_nodes = [_build_node(i) for i in range(top_start, top_end)]
