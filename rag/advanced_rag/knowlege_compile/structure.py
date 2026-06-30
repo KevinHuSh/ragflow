@@ -60,10 +60,11 @@ import asyncio
 import datetime
 import json
 import logging
-from typing import Tuple
+from typing import Callable, Tuple
 
 import xxhash
 
+from common.exceptions import TaskCanceledException
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string
 from rag.prompts.generator import gen_json
@@ -1553,6 +1554,7 @@ async def merge_compiled_structures(
     kb_id: str,
     similarity_threshold: float = 0.98,
     compilation_template_id: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Merge ``docs`` (the output of ``compile_structure_from_text``) before
     inserting them into ES.
@@ -1580,6 +1582,9 @@ async def merge_compiled_structures(
         tenant_id, kb_id: address the doc-store index for the current KB.
         similarity_threshold: minimum cosine similarity for a pair to be
             considered for LLM-judged merge.
+        cancel_check: optional callable returning True when the owning parse
+            task has been canceled. Checked between ES-dedup iterations so a
+            long merge can stop promptly.
 
     Returns:
         {"inserted": N, "updated": M, "duplicates_dropped": K} summary.
@@ -1601,9 +1606,16 @@ async def merge_compiled_structures(
         if d.get("doc_id") and d.get("compile_kwd") and d.get("knowledge_graph_kwd") in ("entity", "relation")
     }
 
+    def _raise_if_canceled() -> None:
+        if callable(cancel_check) and cancel_check():
+            raise TaskCanceledException(
+                "Task was cancelled during structure ES dedup merge"
+            )
+
     inserted = 0
     updated = 0
     for d in deduped:
+        _raise_if_canceled()
         try:
             result = await _struct_es_dedup_one(
                 d, chat_mdl, embd_mdl, tenant_id, kb_id, similarity_threshold,
@@ -1618,6 +1630,7 @@ async def merge_compiled_structures(
 
     graphs = 0
     for doc_id, compile_kwd, template_id in graph_keys:
+        _raise_if_canceled()
         try:
             await rebuild_structure_graph_json(
                 tenant_id, kb_id, doc_id, compile_kwd,

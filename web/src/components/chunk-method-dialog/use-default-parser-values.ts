@@ -23,7 +23,7 @@ export function useDefaultParserValues() {
       mineru_formula_enable: true,
       mineru_table_enable: true,
       mineru_lang: 'English',
-      compilation_template_group_id: '',
+      compilation_template_group_id: [],
       raptor: {
         use_raptor: false,
         prompt: t('knowledgeConfiguration.promptText'),

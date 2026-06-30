@@ -29,6 +29,14 @@ type UseDatasetTableColumnsType = UseChangeDocumentParserShowType &
     showManageMetadataModal: (config: ShowManageMetadataModalProps) => void;
   };
 
+function getCompilationTemplateGroupCount(doc: IDocumentInfo) {
+  const raw = doc.parser_config?.compilation_template_group_id;
+  if (typeof raw === 'string') return raw.trim() ? 1 : 0;
+  if (!Array.isArray(raw)) return 0;
+  return raw.filter((id): id is string => typeof id === 'string' && !!id.trim())
+    .length;
+}
+
 export function useDatasetTableColumns({
   showChangeParserModal,
   showRenameModal,
@@ -88,14 +96,9 @@ export function useDatasetTableColumns({
       meta: { cellClassName: 'max-w-[20vw]' },
       cell: ({ row }) => {
         const name: string = row.getValue('name');
-        // Post template-group refactor a doc references a single
-        // group id (1 if set, 0 otherwise). The column UI still uses a
-        // count, so we coerce presence → 0/1.
         const compilationTemplateCount =
           row.original.compilation_template_count ??
-          (row.original.parser_config?.compilation_template_group_id?.trim?.()
-            ? 1
-            : 0);
+          getCompilationTemplateGroupCount(row.original);
         const hasCompilationTemplate = compilationTemplateCount > 0;
 
         return (

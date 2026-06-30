@@ -924,8 +924,8 @@ class RecursiveAbstractiveProcessing4TreeOrganizedRetrieval:
                             ids.append(s)
                 return {"title": _title_at(idx), "source_chunk_ids": ids}
             return {
-                "title": _title_at(idx),
                 "children": [_build_node(c) for c in children_idx],
+                "title": _title_at(idx),
             }
 
         top_nodes = [_build_node(i) for i in range(top_start, top_end)]

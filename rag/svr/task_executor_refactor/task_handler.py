@@ -74,38 +74,56 @@ from common import settings
 
 
 
-def _parser_config_compilation_template_group_id(parser_config) -> str:
-    """Read the single template-group id from a doc's parser_config.
+def _parser_config_compilation_template_group_ids(parser_config) -> list[str]:
+    """Read template-group ids from a doc's parser_config.
 
     Templates were previously referenced as a list
     (``compilation_template_ids``); after the template-group refactor
-    a doc instead points at a single group, and the orchestrator
-    resolves the group's child templates at runtime. Old
+    a doc instead points at one or more groups, and the orchestrator
+    resolves each group's child templates at runtime. Old
     ``compilation_template_ids`` data is intentionally ignored per
     the migration spec.
     """
+    def _normalize(raw) -> list[str]:
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        ids: list[str] = []
+        seen: set[str] = set()
+        for gid in raw:
+            if not isinstance(gid, str):
+                continue
+            gid = gid.strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                ids.append(gid)
+        return ids
+
     if not isinstance(parser_config, dict):
-        return ""
-    gid = parser_config.get("compilation_template_group_id")
-    if isinstance(gid, str) and gid.strip():
-        return gid.strip()
+        return []
+    if "compilation_template_group_id" in parser_config:
+        return _normalize(parser_config.get("compilation_template_group_id"))
     ext = parser_config.get("ext")
     if isinstance(ext, dict):
-        gid = ext.get("compilation_template_group_id")
-        if isinstance(gid, str) and gid.strip():
-            return gid.strip()
-    return ""
+        return _normalize(ext.get("compilation_template_group_id"))
+    return []
 
 
 def _parser_config_compilation_template_ids(parser_config, tenant_id: str) -> list[str]:
-    """Resolve a doc's parser_config to its compile-template ids by
-    looking up the configured group. Returns ``[]`` if the doc has no
-    group set or the group cannot be resolved.
+    """Resolve a doc's parser_config to compile-template ids by
+    looking up configured groups. Returns ``[]`` if the doc has no
+    group set or no group can be resolved.
     """
-    group_id = _parser_config_compilation_template_group_id(parser_config)
-    if not group_id:
-        return []
-    return CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id)
+    template_ids: list[str] = []
+    seen: set[str] = set()
+    for group_id in _parser_config_compilation_template_group_ids(parser_config):
+        for template_id in CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id):
+            if template_id in seen:
+                continue
+            seen.add(template_id)
+            template_ids.append(template_id)
+    return template_ids
 
 
 def _resolve_template_chat_llm_id(parser_cfg: dict, ctx) -> str:
@@ -992,6 +1010,7 @@ class TaskHandler:
                 ctx.tenant_id,
                 ctx.kb_id,
                 compilation_template_id=template_id,
+                cancel_check=lambda: ctx.has_canceled_func(ctx.id),
             )
             acc.clear()
             if isinstance(info, dict):
@@ -1039,6 +1058,10 @@ class TaskHandler:
                     await _flush(template_id)
 
         for idx, (template_id, _parser_cfg) in enumerate(active_templates):
+            if ctx.has_canceled_func(ctx.id):
+                raise TaskCanceledException(
+                    f"Task {ctx.id} was cancelled during document knowledge compilation"
+                )
             await _flush(template_id)
             agg = agg_infos[template_id]
             ctx.recording_context.record(f"document_structure_compile:{template_id}", agg)
@@ -1227,6 +1250,26 @@ class TaskHandler:
                     template_id, doc_id,
                 )
                 continue
+
+            # Auto-append/update this doc's row in the KB's nav
+            # markdown so a downstream router can locate the doc by
+            # its short root summary. Cross-template by design (Q2:
+            # union) — if a KB has multiple tree templates, whichever
+            # finishes last for the doc wins. Best-effort: failures
+            # here log but don't block subsequent docs/templates.
+            try:
+                from rag.advanced_rag.knowlege_compile.dataset_nav import (
+                    upsert_dataset_nav_doc,
+                )
+                await upsert_dataset_nav_doc(
+                    ctx.tenant_id, ctx.kb_id, doc_id, tree,
+                )
+            except Exception:
+                logging.exception(
+                    "tree-template %s: dataset_nav upsert failed for doc %s",
+                    template_id, doc_id,
+                )
+
             progress_cb(
                 msg=f"tree-template ({idx + 1}/{len(templates)}): "
                     f"persisted {len(graph['entities'])} node(s), "
@@ -2077,11 +2120,11 @@ class TaskHandler:
 
         from rag.raptor import RecursiveAbstractiveProcessing4TreeOrganizedRetrieval as Raptor
         raptor = Raptor(
-            max_cluster=64,
+            max_cluster=128,
             llm_model=chat_mdl,
             embd_model=embedding_model,
             prompt="Please write a concise summary of the following texts:\n{cluster_content}",
-            max_token=512,
+            max_token=256,
             threshold=0.1,
             max_errors=3,
         )

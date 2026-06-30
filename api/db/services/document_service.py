@@ -489,6 +489,19 @@ class DocumentService(CommonService):
         except Exception as e:
             logging.error(f"Failed to delete chunks from doc store for document {doc.id}: {e}")
 
+        # Prune this doc's line from the KB's tree-kind navigation
+        # markdown (best-effort — the markdown is a downstream artifact,
+        # and failure here must not block the document delete).
+        try:
+            from rag.advanced_rag.knowlege_compile.dataset_nav import (
+                remove_dataset_nav_doc_sync,
+            )
+            remove_dataset_nav_doc_sync(tenant_id, doc.kb_id, doc.id)
+        except Exception as e:
+            logging.warning(
+                f"Failed to prune dataset_nav for document {doc.id}: {e}",
+            )
+
         # Delete document metadata (non-critical, log and continue)
         try:
             DocMetadataService.delete_document_metadata(doc.id, doc.kb_id, tenant_id)

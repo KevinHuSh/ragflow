@@ -69,6 +69,15 @@ import {
 
 const FormId = 'ChunkMethodDialogForm';
 
+function normalizeCompilationTemplateGroupIds(value: unknown): string[] {
+  const raw =
+    typeof value === 'string' ? [value] : Array.isArray(value) ? value : [];
+  return raw
+    .filter((id): id is string => typeof id === 'string')
+    .map((id) => id.trim())
+    .filter(Boolean);
+}
+
 function KnowledgeCompilationTemplateSelect() {
   const form = useFormContext();
   const { t } = useTranslate('knowledgeConfiguration');
@@ -89,10 +98,20 @@ function KnowledgeCompilationTemplateSelect() {
       control={form.control}
       name="parser_config.compilation_template_group_id"
       render={({ field }) => {
-        const selectedValue =
-          typeof field.value === 'string' ? field.value : '';
-        const selectedLabel =
-          options.find((option) => option.value === selectedValue)?.label ?? '';
+        const selectedValues = normalizeCompilationTemplateGroupIds(
+          field.value,
+        );
+        const selectedSet = new Set(selectedValues);
+        const selectedLabel = options
+          .filter((option) => selectedSet.has(option.value))
+          .map((option) => option.label)
+          .join(', ');
+        const toggleValue = (value: string) => {
+          const next = selectedSet.has(value)
+            ? selectedValues.filter((id) => id !== value)
+            : [...selectedValues, value];
+          field.onChange(next);
+        };
 
         return (
           <FormItem>
@@ -126,21 +145,24 @@ function KnowledgeCompilationTemplateSelect() {
                         {/* Sentinel for clearing the selection — the
                             doc's compilation runs are gated on this
                             id being non-empty, so an explicit "None"
-                            row keeps the form a single-select. */}
+                            row clears the selected groups. */}
                         <CommandItem
                           value="__none__"
-                          onSelect={() => field.onChange('')}
+                          onSelect={() => field.onChange([])}
                         >
-                          <Checkbox checked={!selectedValue} className="mr-2" />
+                          <Checkbox
+                            checked={selectedValues.length === 0}
+                            className="mr-2"
+                          />
                           <span>{t('common.none')}</span>
                         </CommandItem>
                         {options.map((option) => {
-                          const checked = selectedValue === option.value;
+                          const checked = selectedSet.has(option.value);
                           return (
                             <CommandItem
                               key={option.value}
                               value={option.label}
-                              onSelect={() => field.onChange(option.value)}
+                              onSelect={() => toggleValue(option.value)}
                             >
                               <Checkbox checked={checked} className="mr-2" />
                               <span className="flex-1">{option.label}</span>
@@ -231,7 +253,10 @@ export function ChunkMethodDialog({
         mineru_formula_enable: z.boolean().optional(),
         mineru_table_enable: z.boolean().optional(),
         mineru_lang: z.string().optional(),
-        compilation_template_group_id: z.string().optional(),
+        compilation_template_group_id: z
+          .union([z.string(), z.array(z.string())])
+          .optional()
+          .transform((value) => normalizeCompilationTemplateGroupIds(value)),
         raptor: z
           .object({
             use_raptor: z.boolean().optional(),
@@ -390,8 +415,10 @@ export function ChunkMethodDialog({
             'compilation_template_id',
             'compilation_template_ids',
           ),
-          compilation_template_group_id:
-            (parserConfig as any)?.compilation_template_group_id ?? '',
+          compilation_template_group_id: normalizeCompilationTemplateGroupIds(
+            (parserConfig as any)?.compilation_template_group_id ??
+              (parserConfig as any)?.ext?.compilation_template_group_id,
+          ),
           image_table_context_window:
             parserConfig?.image_table_context_window ??
             parserConfig?.image_context_size ??

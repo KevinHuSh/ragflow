@@ -562,20 +562,37 @@ async def get_document_structure_graph(tenant_id, dataset_id, document_id):
     # Artifacts-kind templates render on the dataset Artifact tab, not
     # here, so they're filtered out.
     parser_config = docs[0].parser_config or {}
-    group_id = ""
+    def _group_ids(raw) -> list[str]:
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return []
+        ids: list[str] = []
+        seen: set[str] = set()
+        for gid in raw:
+            if not isinstance(gid, str):
+                continue
+            gid = gid.strip()
+            if gid and gid not in seen:
+                seen.add(gid)
+                ids.append(gid)
+        return ids
+
+    group_ids: list[str] = []
     if isinstance(parser_config, dict):
-        gid = parser_config.get("compilation_template_group_id")
-        if isinstance(gid, str) and gid.strip():
-            group_id = gid.strip()
+        if "compilation_template_group_id" in parser_config:
+            group_ids = _group_ids(parser_config.get("compilation_template_group_id"))
         elif isinstance(parser_config.get("ext"), dict):
-            gid = parser_config["ext"].get("compilation_template_group_id")
-            if isinstance(gid, str) and gid.strip():
-                group_id = gid.strip()
-    configured_ids: list[str] = (
-        CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id)
-        if group_id
-        else []
-    )
+            group_ids = _group_ids(parser_config["ext"].get("compilation_template_group_id"))
+
+    configured_ids: list[str] = []
+    seen_configured_ids: set[str] = set()
+    for group_id in group_ids:
+        for template_id in CompilationTemplateGroupService.resolve_template_ids(group_id, tenant_id):
+            if template_id in seen_configured_ids:
+                continue
+            seen_configured_ids.add(template_id)
+            configured_ids.append(template_id)
 
     # template_id → {name, kind, parser_kind_norm}
     template_meta: dict[str, dict] = {}
