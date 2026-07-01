@@ -176,7 +176,7 @@ class RedisDB:
         try:
             return self.REDIS.exists(k)
         except Exception as e:
-            logging.warning("RedisDB.exist " + str(k) + " got exception: " + str(e))
+            logging.warning("RedisDB.exist got exception: %s", str(e))
             self.__open__()
 
     def get(self, k):
@@ -185,7 +185,7 @@ class RedisDB:
         try:
             return self.REDIS.get(k)
         except Exception as e:
-            logging.warning("RedisDB.get " + str(k) + " got exception: " + str(e))
+            logging.warning("RedisDB.get got exception: %s", str(e))
             self.__open__()
 
     def set_obj(self, k, obj, exp=3600):
@@ -193,7 +193,7 @@ class RedisDB:
             self.REDIS.set(k, json.dumps(obj, ensure_ascii=False), exp)
             return True
         except Exception as e:
-            logging.warning("RedisDB.set_obj " + str(k) + " got exception: " + str(e))
+            logging.warning("RedisDB.set_obj got exception: %s", str(e))
             self.__open__()
         return False
 
@@ -202,7 +202,7 @@ class RedisDB:
             self.REDIS.set(k, v, exp)
             return True
         except Exception as e:
-            logging.warning("RedisDB.set " + str(k) + " got exception: " + str(e))
+            logging.warning("RedisDB.set got exception: %s", str(e))
             self.__open__()
         return False
 
@@ -219,7 +219,7 @@ class RedisDB:
             self.REDIS.sadd(key, member)
             return True
         except Exception as e:
-            logging.warning("RedisDB.sadd " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.sadd got exception: %s", str(e))
             self.__open__()
         return False
 
@@ -228,7 +228,7 @@ class RedisDB:
             self.REDIS.srem(key, member)
             return True
         except Exception as e:
-            logging.warning("RedisDB.srem " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.srem got exception: %s", str(e))
             self.__open__()
         return False
 
@@ -248,7 +248,7 @@ class RedisDB:
             self.REDIS.zadd(key, {member: score})
             return True
         except Exception as e:
-            logging.warning("RedisDB.zadd " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.zadd got exception: %s", str(e))
             self.__open__()
         return False
 
@@ -257,7 +257,7 @@ class RedisDB:
             res = self.REDIS.zcount(key, min, max)
             return res
         except Exception as e:
-            logging.warning("RedisDB.zcount " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.zcount got exception: %s", str(e))
             self.__open__()
         return 0
 
@@ -266,7 +266,7 @@ class RedisDB:
             res = self.REDIS.zpopmin(key, count)
             return res
         except Exception as e:
-            logging.warning("RedisDB.zpopmin " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.zpopmin got exception: %s", str(e))
             self.__open__()
         return None
 
@@ -538,7 +538,7 @@ class RedisDB:
             self.REDIS.delete(key)
             return True
         except Exception as e:
-            logging.warning("RedisDB.delete " + str(key) + " got exception: " + str(e))
+            logging.warning("RedisDB.delete got exception: %s", str(e))
             self.__open__()
         return False
 

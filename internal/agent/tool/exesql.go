@@ -14,7 +14,7 @@
 //  limitations under the License.
 //
 
-// Package tool — ExeSQL tool (Phase 3 batch 1).
+// Package tool — ExeSQL tool.
 //
 // ExeSQL lets an Agent component execute a SQL statement on a
 // user-configured external database and return the rows as
@@ -46,7 +46,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,9 +61,9 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// ExeSQL-specific errors. The previous Phase 3 batch 1 stub returned
-// ErrExeSQLDAOMissing because the implementation was a no-op pending
-// the (now rejected) GORM wiring. With the real `database/sql`
+// ExeSQL-specific errors. ErrExeSQLDAOMissing is surfaced when
+// no DAO is registered. The current implementation routes
+// through `database/sql` (see openSQLDB below).
 // implementation in place, the error surface is:
 //   - ErrExeSQLNotSelect: SQL failed the SELECT-only safety filter.
 //   - ErrExeSQLNoCredentials: the tool has no db_type/host/etc. set
@@ -101,6 +103,48 @@ type exesqlConnParams struct {
 	Port       int
 	Password   string
 	MaxRecords int
+}
+
+// ExeSQLConnParams is the public alias of exesqlConnParams for
+// external callers (e.g. internal/agent/component/Universe A
+// delegation wrappers). The internal lowercase name stays for
+// backward-compat with existing in-package callers.
+type ExeSQLConnParams = exesqlConnParams
+
+// NewExeSQLConnParams decodes a canvas-node params map into an
+// ExeSQLConnParams. Returns an error if any required field
+// (db_type, host, database, username) is missing.
+//
+// Callers (e.g. the Universe A exesqlComponent wrapper) build the
+// params map from the canvas DSL; the tool-side decoding stays
+// in this package so the schema lives next to the type.
+func NewExeSQLConnParams(params map[string]any) (ExeSQLConnParams, error) {
+	conn := ExeSQLConnParams{}
+	if v, ok := params["db_type"].(string); ok {
+		conn.DBType = v
+	}
+	if v, ok := params["database"].(string); ok {
+		conn.Database = v
+	}
+	if v, ok := params["username"].(string); ok {
+		conn.Username = v
+	}
+	if v, ok := params["host"].(string); ok {
+		conn.Host = v
+	}
+	if v, ok := params["port"].(int); ok {
+		conn.Port = v
+	}
+	if v, ok := params["password"].(string); ok {
+		conn.Password = v
+	}
+	if v, ok := params["max_records"].(int); ok {
+		conn.MaxRecords = v
+	}
+	if conn.DBType == "" || conn.Host == "" || conn.Username == "" || conn.Database == "" {
+		return conn, fmt.Errorf("ExeSQL: missing required connection params (db_type/host/database/username)")
+	}
+	return conn, nil
 }
 
 // exesqlArgs is the JSON shape the model sends in. Matches the Python
@@ -143,7 +187,7 @@ func defaultExeSQLDialer(driver, dsn string) (*sql.DB, error) {
 	return db, nil
 }
 
-// ExeSQLTool is the Phase 3 batch 1 implementation of the ExeSQL tool.
+// ExeSQLTool is the ExeSQL tool.
 // It validates SELECT-only at the parser level and executes the
 // statement against a user-configured external DB via `database/sql`.
 type ExeSQLTool struct {
@@ -228,6 +272,18 @@ func (e *ExeSQLTool) InvokableRun(ctx context.Context, argumentsInJSON string, _
 	if err := conn.check(); err != nil {
 		return exesqlErrorResult(err), err
 	}
+
+	// The DB host/port are node-author-controlled and are connected to
+	// server-side, so guard against SSRF (internal hosts, loopback, cloud
+	// metadata) before any driver dispatch — mirroring the
+	// `test_db_connection` endpoint guard. Connect to the validated,
+	// resolved public IP so a later DNS change cannot rebind the host
+	// to an internal address (mirrors agent/tools/exesql.py PR #15609).
+	safeHost, ssrfErr := ValidateDBHost(conn.Host)
+	if ssrfErr != nil {
+		return exesqlErrorResult(ssrfErr), ssrfErr
+	}
+	conn.Host = safeHost
 
 	driver, dsn, err := exesqlDriverAndDSN(conn)
 	if err != nil {
@@ -409,31 +465,60 @@ func exesqlMarshalResult(r *exesqlResult) (string, error) {
 // driver name and DSN. OceanBase reuses the MySQL driver with a
 // utf8mb4 charset — same trick the Python tool pulls in
 // `pymysql.connect(..., charset='utf8mb4')`.
+//
+// IPv6 safety: `ValidateDBHost` (PR #15609) can return a public IPv6
+// literal (e.g. "2001:db8::1"). The MySQL driver requires bracketed
+// host:port for IPv6 — we route the MySQL/OceanBase paths through
+// net.JoinHostPort so an IPv6 host produces `tcp([2001:db8::1]:3306)`.
+//
+// Driver-specific format rules (PR review round 6, Major #4):
+//   - mysql / oceanbase: `tcp(<host:port>)` URL form — host:port is
+//     a single bracketed value (JoinHostPort handles IPv6).
+//   - lib/pq: keyword=value DSN — `host=` and `port=` are DISTINCT
+//     fields. Combining them as `host=h:p` is rejected by the driver.
+//   - go-mssqldb (denisenkom): ADO-style DSN — `server=` and `port=`
+//     are DISTINCT fields. `server=h:p;port=p` is also rejected.
 func exesqlDriverAndDSN(c exesqlConnParams) (driver, dsn string, err error) {
+	mysqlHostPort := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	switch strings.ToLower(c.DBType) {
 	case "mysql", "mariadb":
 		return "mysql", fmt.Sprintf(
-			"%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4",
-			c.Username, c.Password, c.Host, c.Port, c.Database,
+			"%s:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4",
+			c.Username, c.Password, mysqlHostPort, c.Database,
 		), nil
 	case "oceanbase":
 		// OceanBase MySQL-compat mode: same driver, MySQL wire protocol.
 		return "mysql", fmt.Sprintf(
-			"%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4",
-			c.Username, c.Password, c.Host, c.Port, c.Database,
+			"%s:%s@tcp(%s)/%s?parseTime=true&charset=utf8mb4",
+			c.Username, c.Password, mysqlHostPort, c.Database,
 		), nil
 	case "postgres", "postgresql":
+		// lib/pq: keyword DSN — host and port are separate fields.
+		// For IPv6, lib/pq accepts `host=[2001:db8::1]` (the bracketed
+		// form is the documented IPv6 representation).
+		pgHost := c.Host
+		if strings.Contains(pgHost, ":") {
+			pgHost = "[" + pgHost + "]"
+		}
 		return "postgres", fmt.Sprintf(
 			"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
-			c.Host, c.Port, c.Username, c.Password, c.Database,
+			pgHost, c.Port, c.Username, c.Password, c.Database,
 		), nil
 	case "mssql", "sqlserver":
+		// denisenkom/go-mssqldb: ADO-style DSN — server and port are
+		// separate fields. For IPv6, the ADO form requires the
+		// bracketed host. We use the bracketed form whenever the host
+		// contains a colon (the unambiguous IPv6 marker).
+		msHost := c.Host
+		if strings.Contains(msHost, ":") {
+			msHost = "[" + msHost + "]"
+		}
 		return "sqlserver", fmt.Sprintf(
 			"server=%s;port=%d;user id=%s;password=%s;database=%s",
-			c.Host, c.Port, c.Username, c.Password, c.Database,
+			msHost, c.Port, c.Username, c.Password, c.Database,
 		), nil
 	case "trino":
-		return "", "", fmt.Errorf("%w: trino", ErrExeSQLUnsupportedDB)
+		return "trino", trinoDSN(c), nil
 	case "ibm db2":
 		return "", "", fmt.Errorf("%w: ibm db2", ErrExeSQLUnsupportedDB)
 	default:
@@ -470,18 +555,18 @@ var leadingKeywordRe = regexp.MustCompile(`^[\s,;(]*([A-Za-z]+)`)
 var nonSelectKeywords = map[string]struct{}{
 	"INSERT": {}, "UPDATE": {}, "DELETE": {}, "REPLACE": {},
 	"TRUNCATE": {},
-	"CREATE": {}, "DROP": {}, "ALTER": {}, "RENAME": {},
+	"CREATE":   {}, "DROP": {}, "ALTER": {}, "RENAME": {},
 	"GRANT": {}, "REVOKE": {},
 	"LOCK": {}, "UNLOCK": {},
 	"CALL": {}, "EXEC": {}, "EXECUTE": {},
-	"COPY": {},
+	"COPY":   {},
 	"VACUUM": {}, "ANALYZE": {},
 	"SET": {}, "RESET": {},
-	"USE":  {},
-	"KILL": {},
-	"LOAD": {},
+	"USE":        {},
+	"KILL":       {},
+	"LOAD":       {},
 	"CHECKPOINT": {},
-	"BEGIN": {}, "COMMIT": {}, "ROLLBACK": {}, "START": {},
+	"BEGIN":      {}, "COMMIT": {}, "ROLLBACK": {}, "START": {},
 	"SHUTDOWN": {},
 }
 
@@ -489,7 +574,7 @@ var nonSelectKeywords = map[string]struct{}{
 // heuristic is intentionally narrow: strip line + block comments and
 // string literals, scan the first keyword, and reject if it's a
 // DML/DDL/DCL verb. SQL parsers in Go stdlib don't exist; this matches
-// the safety bar the Go shell needs in Phase 3 batch 1.
+// the safety bar the Go shell needs.
 func isSelectStatement(sql string) bool {
 	cleaned := stripSQLComments(sql)
 	cleaned = stripSQLStrings(cleaned)

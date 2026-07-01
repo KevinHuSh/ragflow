@@ -69,6 +69,7 @@ export default {
       add: 'Add',
       remove: 'Remove',
       search: 'Search',
+      reset: 'Reset',
       noDataFound: 'No data found.',
       noData: 'No data available',
       promptPlaceholder: `Please input or use / to quickly insert variables.`,
@@ -82,6 +83,8 @@ export default {
       selected: 'Selected',
       seeAll: 'See all',
       bulkOperate: 'Bulk operate',
+      owner: 'Owner',
+      running: 'Running...',
     },
     login: {
       loginTitle: 'Sign in to your account',
@@ -123,6 +126,9 @@ export default {
       welcome: 'Welcome to',
       dataset: 'Dataset',
       memories: 'Memory',
+      discord: 'Discord',
+      github: 'GitHub',
+      help: 'Help',
     },
     skills: {
       title: 'Skills',
@@ -383,7 +389,6 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
       metadata: {
         fields: 'fields',
         selectFiles: 'Selected {{count}} files',
-        type: 'Type',
         fieldNameInvalid: 'Field name can only contain letters or underscores.',
         builtIn: 'Built-in',
         generation: 'Generation',
@@ -414,6 +419,7 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
         value: 'Value',
         action: 'Action',
         field: 'Field',
+        type: 'Type',
         description: 'Description',
         fieldName: 'Field name',
         editMetadata: 'Edit metadata',
@@ -941,6 +947,8 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       size: 'Size',
       uploadedTime: 'Uploaded time',
       chunk: 'Chunk',
+      createChunk: 'Create chunk',
+      editChunk: 'Edit chunk',
       bulk: 'Bulk',
       selectAll: 'Select all',
       enabledSelected: 'Enable selected',
@@ -1065,6 +1073,12 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       maxTokensTip: `The maximum context size of the model; an invalid or incorrect value will cause an error. Defaults to 512.`,
       maxTokensInvalidMessage: 'Please enter a valid number for Max tokens.',
       maxTokensMinMessage: 'Max tokens cannot be less than 0.',
+      thinking: 'Thinking',
+      thinkingDefault: 'System default',
+      thinkingEnabled: 'Enabled',
+      thinkingDisabled: 'Disabled',
+      thinkingTip:
+        'Only controls thinking mode for official Qwen, Kimi, and GLM model providers. System default disables Qwen thinking to avoid long-running tasks.',
       quote: 'Show quote',
       quoteTip: 'Whether to display the original text as a reference.',
       selfRag: 'Self-RAG',
@@ -1159,9 +1173,15 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       cancel: 'Cancel',
       chatSetting: 'Chat setting',
       tocEnhance: 'PageIndex',
-      tocEnhanceTip: ` During the parsing of the document, table of contents information was generated (see the 'Enable Table of Contents Extraction' option in the General method). This allows the large model to return table of contents items relevant to the user's query, thereby using these items to retrieve related chunks and apply weighting to these chunks during the sorting process. This approach mimics human information-searching behavior in books.`,
+      tocEnhanceTip: `During the parsing of the document, table of contents information was generated (see the 'Enable Table of Contents Extraction' option in the General method). This allows the large model to return table of contents items relevant to the user's query, thereby using these items to retrieve related chunks and apply weighting to these chunks during the sorting process. This approach mimics human information-searching behavior in books.`,
       batchDeleteSessions: 'Batch delete',
       deleteSelectedConfirm: 'Delete the selected {{count}} session(s)?',
+      showChunkMetadata: 'Show chunk metadata',
+      showChunkMetadataTip:
+        'Display document metadata (e.g., title, page number, upload date) alongside retrieved text chunks',
+      metadataFields: 'Metadata fields',
+      metadataFieldsTip:
+        'Select which metadata fields to display with each chunk',
     },
     setting: {
       Verify: 'Verify',
@@ -1399,6 +1419,32 @@ Example: Virtual Hosted Style`,
         'Column to use as unique document ID. If not specified, a hash of the content will be used.',
       postgresqlTimestampColumnTip:
         'Datetime/timestamp column for incremental sync. Only rows modified after the last sync will be fetched.',
+      bigqueryDescription:
+        'Connect to Google BigQuery to sync rows from a table or a custom GoogleSQL query.',
+      bigqueryProjectIdTip:
+        'GCP project that owns the query jobs (e.g. my-gcp-project).',
+      bigqueryLocationTip:
+        'Default location for the client and query jobs, such as US or EU. Leave empty to let BigQuery infer it.',
+      bigqueryServiceAccountJsonTip:
+        'Service account key JSON with BigQuery access. Paste the full key file contents.',
+      bigqueryDatasetIdTip:
+        'Dataset id for table mode. Required together with Table ID when no SQL query is provided.',
+      bigqueryTableIdTip:
+        'Table id for table mode. Required together with Dataset ID when no SQL query is provided.',
+      bigqueryQueryTip:
+        'Custom GoogleSQL query. Takes precedence over Dataset ID and Table ID. Standard SQL only.',
+      bigqueryContentColumnsTip:
+        'Comma-separated column names whose values will be combined as document content for vectorization.',
+      bigqueryMetadataColumnsTip:
+        'Comma-separated column names to store as document metadata (not vectorized, but searchable).',
+      bigqueryIdColumnTip:
+        'Column to use as unique document ID. If not specified, a hash of the content will be used.',
+      bigqueryTimestampColumnTip:
+        'Timestamp, datetime, date, or numeric column for incremental sync. Only rows newer than the last sync will be fetched.',
+      bigqueryMaximumBytesBilledTip:
+        'Hard cost guard applied to every query job, in bytes. Defaults to 1 GiB.',
+      bigqueryJobTimeoutMsTip:
+        'Optional per-query job timeout in milliseconds.',
       rest_apiDescription:
         'Connect any REST API endpoint as a data source using a flexible, configuration-driven connector.',
       onedriveDescription:
@@ -1510,6 +1556,7 @@ Example: Virtual Hosted Style`,
       chatChannelDesc: {
         clickclack: 'Connect a ClickClack bot',
         discord: 'Connect a Discord bot',
+        dingtalk: 'Connect a DingTalk bot',
         feishu: 'Connect a Feishu / Lark bot',
         googlechat: 'Connect a Google Chat bot',
         irc: 'Connect to an IRC server',
@@ -1776,6 +1823,8 @@ Example: Virtual Hosted Style`,
       updateDate: 'Date',
       role: 'State',
       invite: 'Invite member',
+      inviteTip:
+        'Only registered users can be invited. Please register the account before sending an invitation.',
       agree: 'Accept',
       refuse: 'Decline',
       teamMembers: 'Team members',
@@ -1922,6 +1971,8 @@ Example: Virtual Hosted Style`,
         author: 'Author',
         sectionTitle: 'Section title',
       },
+      tags: 'Tags',
+      canvasCategory: 'Canvas category',
       editTags: 'Edit tags',
       editTagsDescription:
         'Add tags to organize and filter your agents. Press Enter or comma to add.',
@@ -2134,6 +2185,12 @@ Best for: Documents with flowing, contextually connected content — such as boo
       searXNG: 'SearXNG',
       searXNGDescription:
         'A component that searches via your provided SearXNG instance URL. Specify TopN and the instance URL.',
+      keenableSearch: 'Keenable',
+      keenableSearchDescription:
+        'A web search component powered by Keenable, a search API built for AI agents. Works without an API key by default (keyless free tier); add a key to lift rate limits.',
+      keenableMode: 'Search mode',
+      keenableSite: 'Site',
+      keenableApiKeyTip: 'Optional. Leave blank to use the keyless free tier.',
       docGenerator: 'Doc Generator',
       docGeneratorDescription: `Generate a file from Markdown content.`,
       browser: 'Browser',
@@ -2686,6 +2743,8 @@ This process aggregates variables from multiple branches into a single variable 
       createFromBlank: 'Create from blank',
       createFromTemplate: 'Create from template',
       importJsonFile: 'Import JSON file',
+      duplicate: 'Duplicate',
+      copyOfAgentName: '{{name}} (copy)',
       ceateAgent: 'Workflow',
       createPipeline: 'Ingestion pipeline',
       chooseAgentType: 'Choose agent type',
@@ -2870,6 +2929,9 @@ Important structured information may include: names, dates, locations, events, k
           'Accepted Response: The system returns an acknowledgment immediately after the request is validated, while the workflow continues to execute asynchronously in the background. /Final Response: The system returns a response only after the workflow execution is completed.',
         authMethods: 'Authentication methods',
         authType: 'Authentication type',
+        allowAnonymous: 'Allow anonymous access',
+        allowAnonymousTip:
+          'Anyone with this webhook URL can trigger the agent when this is enabled.',
         limit: 'Request frequency limit',
         per: 'Time period',
         maxBodySize: 'Maximum body size',
@@ -3116,6 +3178,7 @@ Important structured information may include: names, dates, locations, events, k
       okText: 'Save',
       cancelText: 'Cancel',
       chooseDataset: 'Please select a dataset first',
+      selectLocalePlaceholder: 'Select a locale',
     },
     language: {
       english: 'English',

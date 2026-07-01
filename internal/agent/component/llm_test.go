@@ -1,4 +1,4 @@
-// Package component — LLM unit tests (Phase 2 P0, plan §2.11.3 row 5).
+// Package component — LLM unit tests.
 //
 // Tests use a stub ChatInvoker to avoid the network. The production path
 // flows through einoChatInvoker + models.NewEinoChatModel + the real
@@ -133,18 +133,20 @@ func TestLLM_Stream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	var got map[string]any
-	select {
-	case got = <-ch:
-	case <-context.Background().Done():
-		t.Fatal("context cancelled before chunk")
+	// Drain all chunks; the implementation emits content + done
+	// over the goroutine-streaming pattern.
+	var got []map[string]any
+	for chunk := range ch {
+		got = append(got, chunk)
 	}
-	if got["content"] != "streamed" {
-		t.Errorf("chunk content=%v, want 'streamed'", got["content"])
+	if len(got) != 2 {
+		t.Fatalf("expected 2 chunks (content + done), got %d", len(got))
 	}
-	// Verify the channel closes after the single chunk.
-	if _, open := <-ch; open {
-		t.Error("Stream channel did not close after single chunk")
+	if got[0]["content"] != "streamed" {
+		t.Errorf("chunk[0].content=%v, want 'streamed'", got[0]["content"])
+	}
+	if got[1]["done"] != true {
+		t.Errorf("chunk[1].done=%v, want true", got[1]["done"])
 	}
 }
 
@@ -193,5 +195,61 @@ func TestLLM_Registered(t *testing.T) {
 	}
 	if c.Name() != "LLM" {
 		t.Errorf("Name()=%q, want LLM", c.Name())
+	}
+}
+
+// TestLLM_ThinkingFieldRoundTrip guards the agent-component
+// portion of PR #15446 (thinking switch). The agent component
+// accepts `thinking` from the DSL params (whitelisted to the
+// two known sentinels) and threads it through LLMParam and the
+// ChatInvokeRequest so the default invoker (or a stub) can
+// translate it into the provider-specific request body
+// (Qwen `enable_thinking`, Kimi/GLM `thinking.type`). Provider
+// policy itself lives in internal/llm and is a separate porting
+// stream.
+func TestLLM_ThinkingFieldRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// Case 1: "enabled" round-trips into LLMParam and ChatInvokeRequest.
+	enabled := mergeLLMParam(LLMParam{}, map[string]any{
+		"thinking":      "enabled",
+		"model_id":      "qwen3-max",
+		"system_prompt": "s",
+		"user_prompt":   "u",
+	})
+	if enabled.Thinking != "enabled" {
+		t.Errorf("Thinking = %q, want enabled", enabled.Thinking)
+	}
+
+	// Case 2: "disabled" also round-trips.
+	disabled := mergeLLMParam(LLMParam{}, map[string]any{
+		"thinking":    "disabled",
+		"model_id":    "kimi-k2.6",
+		"user_prompt": "u",
+	})
+	if disabled.Thinking != "disabled" {
+		t.Errorf("Thinking = %q, want disabled", disabled.Thinking)
+	}
+
+	// Case 3: empty / system-default value is preserved (no defaulting).
+	defaulted := mergeLLMParam(LLMParam{}, map[string]any{
+		"model_id":    "glm-4.6",
+		"user_prompt": "u",
+	})
+	if defaulted.Thinking != "" {
+		t.Errorf("Thinking = %q, want empty (system default)", defaulted.Thinking)
+	}
+
+	// Case 4: arbitrary string is REJECTED (DSL safety — the LLM
+	// driver should not see unvalidated values). Mirrors the
+	// python llm.py:78-79 `if get_attr("thinking") in {"enabled",
+	// "disabled"}` gate.
+	arbitrary := mergeLLMParam(LLMParam{}, map[string]any{
+		"thinking":    "yes please",
+		"model_id":    "glm-4.6",
+		"user_prompt": "u",
+	})
+	if arbitrary.Thinking != "" {
+		t.Errorf("arbitrary thinking = %q, want empty (rejected)", arbitrary.Thinking)
 	}
 }
