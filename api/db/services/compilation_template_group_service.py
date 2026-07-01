@@ -348,13 +348,12 @@ class CompilationTemplateGroupService(CommonService):
         index: int,
     ) -> None:
         kind = str((child or {}).get("kind") or "").strip()
+        name = str((child or {}).get("name") or "").strip()
         config = (child or {}).get("config") or {}
-        if not kind or not isinstance(config, dict):
-            raise GroupValidationError("Each template must include a kind and config object.")
-        # ``name`` is no longer collected from the client — derive a
-        # unique storage name from the generated child id. Request display
-        # names are ignored here because group children share the same table
-        # and unique key as standalone templates.
+        if not kind or not name or not isinstance(config, dict):
+            raise GroupValidationError(
+                "Each template must include a name, kind, and config object."
+            )
         from api.db.services.compilation_template_service import CompilationTemplateService
 
         config = CompilationTemplateService.fill_config_default_llm(config, tenant_id)
@@ -363,7 +362,7 @@ class CompilationTemplateGroupService(CommonService):
             id=template_id,
             tenant_id=tenant_id,
             group_id=group_id,
-            name=f"{kind}_{index + 1}_{template_id[:8]}",
+            name=name,
             description=str((child or {}).get("description") or ""),
             kind=kind,
             config=config,

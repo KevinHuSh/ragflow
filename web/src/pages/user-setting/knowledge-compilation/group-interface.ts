@@ -54,9 +54,19 @@ export const compilationTemplateGroupFormSchema = z
         path: ['templates'],
       });
     }
-    // Children are no longer named — uniqueness is implicit in their
-    // (kind, index) tuple, and the group as a whole carries the
-    // human-facing name.
+    // Name uniqueness within the group — mirrors the tenant-wide
+    // uniqueness check for group names but scoped to siblings.
+    const lowered = values.templates.map((t) => t.name.trim().toLowerCase());
+    lowered.forEach((name, i) => {
+      if (!name) return;
+      if (lowered.indexOf(name) !== i) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Template name must be unique within the group.',
+          path: ['templates', i, 'name'],
+        });
+      }
+    });
   });
 
 export type CompilationTemplateGroupFormValues = z.infer<
@@ -95,7 +105,7 @@ export function groupToFormValues(
     name: group.name,
     description: group.description ?? '',
     templates: (group.templates ?? []).map((t) =>
-      templateConfigToFormValues(t.description, t.config),
+      templateConfigToFormValues(t.name, t.description, t.config),
     ),
   };
 }
@@ -110,11 +120,8 @@ export function groupFormValuesToPayload(
   return {
     name: values.name.trim(),
     description: values.description || '',
-    // Per-child ``name`` is no longer collected — the backend derives a
-    // placeholder (``${kind}_${index+1}``) when persisting so the DB's
-    // NOT NULL column stays satisfied without forcing the user to
-    // name each child.
     templates: values.templates.map((t) => ({
+      name: t.name.trim(),
       description: t.description || '',
       kind: t.kind,
       config: formValuesToTemplateConfig(t),

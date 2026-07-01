@@ -16,21 +16,14 @@
 
 
 def validate_template_payload(req: dict, require_all: bool = True) -> str:
-    """Validate a single template payload (kind + config).
-
-    ``name`` is no longer collected from the client — children inside a
-    template group are identified by their (group_id, index, kind), and
-    the service layer auto-derives a placeholder when persisting to keep
-    the DB column non-null. If a client still sends ``name``, it's
-    validated for shape but not required.
-    """
-    required = ["kind", "config"] if require_all else []
+    """Validate a single template payload (kind + config + name)."""
+    required = ["name", "kind", "config"] if require_all else []
     for key in required:
         if key not in req:
             return f"Missing required field: {key}."
 
     name = req.get("name")
-    if name is not None and (not isinstance(name, str) or len(name.encode("utf-8")) > 128):
+    if name is not None and (not isinstance(name, str) or not name.strip() or len(name.encode("utf-8")) > 128):
         return "Invalid template name."
 
     description = req.get("description")

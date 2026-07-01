@@ -77,6 +77,13 @@ export function ChildFormSection({
     name: `${pathPrefix}.kind`,
   }) as CompilationTemplateKind | undefined;
 
+  // Watched so the collapsible header can show the template's name
+  // next to the kind chip. Falls back to a placeholder when empty.
+  const watchedName = useWatch({
+    control: form.control,
+    name: `${pathPrefix}.name`,
+  }) as string | undefined;
+
   // Page-structure example default-prefill for artifacts kind. Fires
   // when the textarea is currently empty so explicit user edits and
   // saved overrides are never clobbered.
@@ -108,7 +115,11 @@ export function ChildFormSection({
 
   const handleApplyBuiltin = useCallback(
     (builtin: BuiltinCompilationTemplate) => {
-      const next = templateConfigToFormValues('', builtin.config);
+      const next = templateConfigToFormValues(
+        watchedName?.trim() || builtin.display_name,
+        '',
+        builtin.config,
+      );
       next.llm_id =
         next.llm_id ||
         form.getValues(`${pathPrefix}.llm_id`) ||
@@ -141,7 +152,7 @@ export function ChildFormSection({
         keepSubmitCount: true,
       });
     },
-    [defaultChatLlmId, form, pathPrefix],
+    [defaultChatLlmId, form, pathPrefix, watchedName],
   );
 
   const kindLabel = watchedKind
@@ -168,6 +179,9 @@ export function ChildFormSection({
             <span className="text-xs uppercase tracking-wide rounded bg-bg-card px-2 py-0.5 shrink-0">
               {kindLabel || t('knowledgeCompilation.kind.empty')}
             </span>
+            <span className="truncate font-medium" title={watchedName}>
+              {watchedName || t('knowledgeCompilation.unnamedTemplate')}
+            </span>
           </button>
         </CollapsibleTrigger>
         <BuiltinTemplatePopover onSelect={handleApplyBuiltin} />
@@ -185,6 +199,24 @@ export function ChildFormSection({
       </div>
 
       <CollapsibleContent className="p-4 pt-0 flex flex-col gap-4 border-t border-border-button">
+        <FormField
+          control={form.control}
+          name={`${pathPrefix}.name` as any}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>{t('knowledgeCompilation.name')}</FormLabel>
+              <FormControl>
+                <Input
+                  {...field}
+                  maxLength={128}
+                  placeholder={t('knowledgeCompilation.namePlaceholder')}
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+
         <FormField
           control={form.control}
           name={`${pathPrefix}.description` as any}
