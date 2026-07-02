@@ -273,7 +273,19 @@ export function useListDatasetArtifactCommits(
         page: paging.page,
         page_size: paging.pageSize,
       });
-      return (data?.data as ArtifactCommitsResponse) ?? EMPTY_COMMITS;
+      // The generic file-commit list endpoint returns
+      // ``{total, page, page_size, commits: [...]}``. Normalize it here
+      // to the pre-existing ``ArtifactCommitsResponse`` shape (with an
+      // ``items`` array) so downstream components can stay unchanged.
+      const raw = (data?.data ?? {}) as {
+        total?: number;
+        commits?: ArtifactCommitsResponse['items'];
+        items?: ArtifactCommitsResponse['items'];
+      };
+      return {
+        total: raw.total ?? 0,
+        items: raw.items ?? raw.commits ?? [],
+      };
     },
   });
 

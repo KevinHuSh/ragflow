@@ -45,6 +45,9 @@ const datasetArtifactService = {
     request.get(api.getDatasetArtifactGraph(params.datasetId), {
       params: params.node ? { node: params.node } : undefined,
     }),
+  // The generic file-commit list endpoint accepts an optional ``?slug=``
+  // filter. We compose ``<page_type>/<page_name>`` here so the caller can
+  // keep passing the two parts separately.
   listCommits: (params: {
     datasetId: string;
     pageType: string;
@@ -52,16 +55,15 @@ const datasetArtifactService = {
     page?: number;
     page_size?: number;
   }) =>
-    request.get(
-      api.listDatasetArtifactCommits(
-        params.datasetId,
-        params.pageType,
-        params.slug,
-      ),
-      {
-        params: { page: params.page, page_size: params.page_size },
+    request.get(api.listDatasetArtifactCommits(params.datasetId), {
+      params: {
+        page: params.page,
+        page_size: params.page_size,
+        slug: params.slug.startsWith(`${params.pageType}/`)
+          ? params.slug
+          : `${params.pageType}/${params.slug}`,
       },
-    ),
+    }),
   getCommit: (params: { datasetId: string; commitId: string }) =>
     request.get(
       api.getDatasetArtifactCommit(params.datasetId, params.commitId),

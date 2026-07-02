@@ -333,17 +333,15 @@ export default {
       .split('/')
       .map((s) => encodeURIComponent(s))
       .join('/')}`,
-  listDatasetArtifactCommits: (
-    datasetId: string,
-    pageType: string,
-    slug: string,
-  ) =>
-    `${restAPIv1}/datasets/${datasetId}/artifacts/${encodeURIComponent(pageType)}/${slug
-      .split('/')
-      .map((s) => encodeURIComponent(s))
-      .join('/')}/commits`,
+  // Artifact-page commit history is now served by the generic file-commit
+  // routes registered under ``/datasets/<id>/commits``. The ``?slug=`` query
+  // param selects one page's history (via FileCommitService.list_page_commits);
+  // the detail endpoint auto-routes to the artifact shape when the row's
+  // ``title`` column is populated.
+  listDatasetArtifactCommits: (datasetId: string) =>
+    `${restAPIv1}/datasets/${datasetId}/commits`,
   getDatasetArtifactCommit: (datasetId: string, commitId: string) =>
-    `${restAPIv1}/datasets/${datasetId}/artifacts/commits/${encodeURIComponent(commitId)}`,
+    `${restAPIv1}/datasets/${datasetId}/commits/${encodeURIComponent(commitId)}`,
 
   // dataset skills (Corpus2Skill tree)
   hasAnySkill: (datasetId: string) =>
