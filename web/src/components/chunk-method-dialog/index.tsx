@@ -69,15 +69,6 @@ import {
 
 const FormId = 'ChunkMethodDialogForm';
 
-function normalizeCompilationTemplateGroupIds(value: unknown): string[] {
-  const raw =
-    typeof value === 'string' ? [value] : Array.isArray(value) ? value : [];
-  return raw
-    .filter((id): id is string => typeof id === 'string')
-    .map((id) => id.trim())
-    .filter(Boolean);
-}
-
 function KnowledgeCompilationTemplateSelect() {
   const form = useFormContext();
   const { t } = useTranslate('knowledgeConfiguration');
@@ -98,19 +89,23 @@ function KnowledgeCompilationTemplateSelect() {
       control={form.control}
       name="parser_config.compilation_template_group_id"
       render={({ field }) => {
-        const selectedValues = normalizeCompilationTemplateGroupIds(
-          field.value,
-        );
-        const selectedSet = new Set(selectedValues);
-        const selectedLabel = options
-          .filter((option) => selectedSet.has(option.value))
-          .map((option) => option.label)
-          .join(', ');
-        const toggleValue = (value: string) => {
-          const next = selectedSet.has(value)
-            ? selectedValues.filter((id) => id !== value)
-            : [...selectedValues, value];
-          field.onChange(next);
+        // Single-select: the field holds a plain string id (or empty).
+        // Legacy array values persisted before the single-select fix
+        // are collapsed to their first element on read so the form
+        // doesn't crash on old docs.
+        const rawValue = field.value;
+        const selectedValue =
+          typeof rawValue === 'string'
+            ? rawValue
+            : Array.isArray(rawValue) && typeof rawValue[0] === 'string'
+              ? (rawValue[0] as string)
+              : '';
+        const selectedLabel =
+          options.find((option) => option.value === selectedValue)?.label ?? '';
+        const pickValue = (value: string) => {
+          // Clicking the currently-selected row clears it, so the
+          // picker doesn't need a separate "clear" affordance.
+          field.onChange(value === selectedValue ? '' : value);
         };
 
         return (
@@ -142,27 +137,13 @@ function KnowledgeCompilationTemplateSelect() {
                         {t('knowledgeCompilationTemplateEmpty')}
                       </CommandEmpty>
                       <CommandGroup>
-                        {/* Sentinel for clearing the selection — the
-                            doc's compilation runs are gated on this
-                            id being non-empty, so an explicit "None"
-                            row clears the selected groups. */}
-                        <CommandItem
-                          value="__none__"
-                          onSelect={() => field.onChange([])}
-                        >
-                          <Checkbox
-                            checked={selectedValues.length === 0}
-                            className="mr-2"
-                          />
-                          <span>{t('common.none')}</span>
-                        </CommandItem>
                         {options.map((option) => {
-                          const checked = selectedSet.has(option.value);
+                          const checked = option.value === selectedValue;
                           return (
                             <CommandItem
                               key={option.value}
                               value={option.label}
-                              onSelect={() => toggleValue(option.value)}
+                              onSelect={() => pickValue(option.value)}
                             >
                               <Checkbox checked={checked} className="mr-2" />
                               <span className="flex-1">{option.label}</span>
@@ -253,10 +234,7 @@ export function ChunkMethodDialog({
         mineru_formula_enable: z.boolean().optional(),
         mineru_table_enable: z.boolean().optional(),
         mineru_lang: z.string().optional(),
-        compilation_template_group_id: z
-          .union([z.string(), z.array(z.string())])
-          .optional()
-          .transform((value) => normalizeCompilationTemplateGroupIds(value)),
+        compilation_template_group_id: z.string().optional(),
         raptor: z
           .object({
             use_raptor: z.boolean().optional(),
@@ -415,10 +393,19 @@ export function ChunkMethodDialog({
             'compilation_template_id',
             'compilation_template_ids',
           ),
-          compilation_template_group_id: normalizeCompilationTemplateGroupIds(
-            (parserConfig as any)?.compilation_template_group_id ??
-              (parserConfig as any)?.ext?.compilation_template_group_id,
-          ),
+          // Single-select: coerce to a plain string. Fall back through
+          // ``ext`` because the doc's persisted parser_config wraps
+          // frontend-added keys under ``ext`` on save. Legacy array
+          // values from before this fix collapse to their first entry.
+          compilation_template_group_id: (() => {
+            const raw =
+              (parserConfig as any)?.compilation_template_group_id ??
+              (parserConfig as any)?.ext?.compilation_template_group_id;
+            if (typeof raw === 'string') return raw.trim();
+            if (Array.isArray(raw) && typeof raw[0] === 'string')
+              return raw[0].trim();
+            return '';
+          })(),
           image_table_context_window:
             parserConfig?.image_table_context_window ??
             parserConfig?.image_context_size ??
