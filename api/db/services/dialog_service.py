@@ -1795,3 +1795,87 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
     mindmap = MindMapExtractor(chat_mdl)
     mind_map = await mindmap([c["content_with_weight"] for c in ranks["chunks"]])
     return mind_map.output
+
+
+async def rag_agent(dialog, messages, stream=True, **kwargs):
+    logging.debug("Begin rag_agent")
+    assert messages[-1]["role"] == "user", "The last content of this conversation is not from user."
+    prompt_config = dialog.prompt_config
+    kbs, embd_mdl, rerank_mdl, chat_mdl, tts_mdl = get_models(dialog)
+    use_web_search = _should_use_web_search(prompt_config, kwargs.get("internet"))
+    logging.debug("web_search kb=%s tavily=%s internet=%r enabled=%s", bool(dialog.kb_ids), bool(dialog.prompt_config.get("tavily_api_key")), kwargs.get("internet"), use_web_search)
+    tenant_ids = list(set([kb.tenant_id for kb in kbs]))
+    rag_tools = RAGTools(tenant_ids, 
+                         chat_mdl,
+                         embed_mdl=embd_mdl,
+                         kb_ids=dialog.kb_ids, 
+                         tav=Tavily(prompt_config["tavily_api_key"]) if use_web_search else None
+                         )
+
+    llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
+    if llm_type != "chat":
+        raise ValueError("rag_agent only supports chat LLMs.")
+    llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+
+    #attachments = None
+    #if "doc_ids" in kwargs:
+    #    attachments = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
+    #if "doc_ids" in messages[-1]:
+    #    attachments = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
+    attachments_ = ""
+    image_attachments = []
+    if "files" in messages[-1]:
+        text_attachments, image_attachments = split_file_attachments(messages[-1]["files"])
+        attachments_ = "\n\n".join(text_attachments)
+    msg = deepcopy(messages)
+    if image_attachments:
+        factory = llm_model_config.get("llm_factory", "") if llm_model_config else ""
+        convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
+    if attachments_:
+        msg[-1]["content"] = msg[-1]["content"] + "\n" + attachments_
+
+    async def decorate_answer(answer):
+        nonlocal rag_tools, messages
+        ans = answer.split("</think>")
+        think = ""
+        if len(ans) == 2:
+            think = ans[0] + "</think>"
+            answer = ans[1]
+
+        answer, _ = repair_bad_citation_formats(answer, rag_tools.kbinfos, set([]))
+
+        refs = deepcopy(rag_tools.kbinfos)
+        for c in refs["chunks"]:
+            if c.get("vector"):
+                del c["vector"]
+
+        if answer.lower().find("invalid key") >= 0 or answer.lower().find("invalid api") >= 0:
+            answer += " Please set LLM API-Key in 'User Setting -> Model providers -> API-Key'"
+
+        return {"answer": think + answer, "reference": refs, "prompt": "", "created_at": time.time()}
+
+    from rag.advanced_rag.agentic_rag_graph import run_agentic_rag
+
+    # Per-turn thread id: conversation id + turn ordinal. Distinct turns get
+    # distinct checkpoints; a retry of the same turn resumes.
+    session_id = kwargs.get("session_id") or ""
+    thread_id = f"{session_id}:{len(messages)}"
+    full_answer = ""
+    try:
+        async for frame in run_agentic_rag(rag_tools, msg, thread_id):
+            if "answer" in frame:
+                delta = frame["answer"] or ""
+                full_answer += delta
+                if stream:
+                    yield {"answer": delta, "reference": {}, "audio_binary": tts(tts_mdl, delta), "final": False}
+            elif "error" in frame:
+                logging.warning("rag_agent(langgraph): %s", frame["error"])
+            # status frames are dropped; the frontend answer stream
+            # contract is {answer, reference, final}.
+    except Exception:
+        logging.exception("rag_agent(langgraph): run failed")
+    final = await decorate_answer(_extract_visible_answer(full_answer))
+    final["final"] = True
+    final["audio_binary"] = None
+    yield final
+    return
