@@ -691,6 +691,73 @@ class RAGTools:
             kb_prompt(self.kbinfos, self.chat_mdl.max_length, start_idx)
         )
 
+    async def retrieve_into(
+        self,
+        question: str,
+        keywords: str = "",
+        docid_scope: List[str] | None = None,
+        top_n: int = 6,
+        similarity_threshold: float = 0.2,
+        using_embedding: bool = False,
+        sink: dict[str, list] | None = None,
+    ) -> dict[str, list]:
+        """Isolated retrieval that appends into a caller-owned ``sink``.
+
+        This is the concurrency-safe sibling of :meth:`search_knowledge_bases`.
+        It runs the SAME retrieval but writes results into ``sink`` (a
+        ``{"chunks": [...], "doc_aggs": [...]}`` dict the caller owns)
+        instead of the shared ``self.kbinfos`` accumulator, and it does
+        NOT stamp citation guidelines (that flips the shared
+        ``self._citations_injected`` flag, which would race across parallel
+        callers).
+
+        Used by the LangGraph sub-question workers so N sub-questions can
+        retrieve in parallel, each into its own pool, with correct
+        per-sub-question attribution. Deliberately NOT a ``@tool`` — the LLM
+        never sees or calls it; only the orchestrator does.
+
+        :returns: the ``sink`` dict (created fresh when ``sink is None``),
+            with the newly retrieved chunks/doc_aggs appended.
+        """
+        pool = sink if sink is not None else {"chunks": [], "doc_aggs": []}
+        if not self.kb_ids:
+            return pool
+
+        if docid_scope:
+            candidates = [d for d in docid_scope if isinstance(d, str)]
+            known = await thread_pool_exec(self._filter_known_doc_ids, candidates)
+            valid = [d for d in candidates if d in known]
+            docid_scope = valid or None
+
+        search_terms = keywords.strip() if keywords else ""
+        if not search_terms or using_embedding:
+            search_terms = question
+        embd_mdl = self.embed_mdl if using_embedding else None
+        vector_weight = 0.7 if embd_mdl else 0
+        try:
+            kbinfos = await settings.retriever.retrieval(
+                search_terms,
+                embd_mdl,
+                self.tenant_ids,
+                self.kb_ids,
+                1,
+                top_n,
+                similarity_threshold,
+                vector_similarity_weight=vector_weight,
+                aggs=True,
+                doc_ids=docid_scope,
+                rank_feature=label_question(question, self.kbs),
+            )
+        except Exception:
+            logging.exception("retrieve_into: retrieval failed for %r", question)
+            return pool
+        chunks = settings.retriever.retrieval_by_children(
+            kbinfos.get("chunks", []), self.tenant_ids,
+        )
+        pool.setdefault("chunks", []).extend(chunks)
+        pool.setdefault("doc_aggs", []).extend(kbinfos.get("doc_aggs", []))
+        return pool
+
     def _resolve_doc_tenant(self, doc_id: str) -> tuple[str, str] | None:
         """Return ``(kb_id, tenant_id)`` for ``doc_id`` if and only if the
         document belongs to one of the agent's bound unstructured KBs.

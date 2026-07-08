@@ -24,26 +24,43 @@ mid-run failure resumes from the last committed node instead of
 re-running the whole procedure (per-turn resume, keyed by
 ``f"{conv_id}:{turn}"``).
 
-Flow (mirrors the user's spec):
+Flow (map-reduce over sub-questions for the ``search_kb`` intent):
 
     START → plan
-    plan ─▶ answer                       (intent == "answer" | iters exhausted)
-         ─▶ select_docs                  (intent == "search_kb")
-         ─▶ select_docs                  (intent == "compare")
-         ─▶ web_search                   (intent == "web_search")
-         ─▶ summarize                    (intent == "summarize")
-         ─▶ structured                   (intent == "structured")
+    plan ─(list[Send])─▶ subq_worker × N    (search_kb: one Send per pending
+                                             sub-question, run in PARALLEL)
+         ─▶ answer                          (intent == "answer" | budget spent)
+         ─▶ select_docs                     (compare)
+         ─▶ web_search                      (web_search)
+         ─▶ summarize                       (summarize)
+         ─▶ structured                      (structured)
+         ─▶ others                          (others)
 
-    select_docs → load_hints → retrieve → plan
-    web_search / summarize / compare / structured → plan
+    subq_worker → plan          (B2 loop: replan after each parallel batch;
+                                 the planner may emit follow-up sub-questions,
+                                 already-answered ones filtered by
+                                 ``answered_subqs``)
+    select_docs → load_hints → compare → plan
+    web_search / summarize / structured → plan
+    others → END
     answer → END
+
+Each ``subq_worker`` retrieves into its OWN ``sink`` (via
+``RAGTools.retrieve_into``) and composes a per-sub-question sub-answer,
+so N sub-questions run concurrently with correct attribution. The
+``answer`` node reduces: it merges every worker's chunks into one
+citation pool and synthesises a single concise answer to the original
+formalized question from the (sub-question, sub-answer) pairs.
+
+The ``sub_results`` / ``answered_subqs`` state fields use an
+``operator.add`` reducer so parallel workers append race-free.
+LangGraph checkpoints per superstep, so a crash in one worker resumes
+re-running ONLY that worker; the others' committed results survive.
 
 Two orthogonal output channels reach the caller through one async queue:
   * ``{"status": <node>}`` frames — cheap step indicators, safe to replay.
-  * ``{"answer": <token>}`` frames — streamed by ``answer`` node only.
-    These live OUTSIDE checkpointed state, so a resume that re-enters the
-    answer node simply re-streams; the retrieved evidence it reads comes
-    from checkpointed ``kbinfos``, so no retrieval is repeated.
+  * ``{"answer": <token>}`` frames — streamed by ``answer`` or ``others``
+    nodes (the N sub-answers are computed inside workers, not streamed).
 
 LangGraph / langgraph-checkpoint-redis are optional deps: this module is
 only imported from the feature-flagged entry point, so the app still
@@ -57,8 +74,10 @@ import json
 import logging
 import re
 from copy import deepcopy
-from typing import Any, AsyncIterator, Optional, TypedDict
+import operator
+from typing import Annotated, AsyncIterator, TypedDict
 
+from api.db.services.dialog_service import _extract_visible_answer, _stream_with_think_delta
 import json_repair
 
 
@@ -67,24 +86,43 @@ import json_repair
 # --------------------------------------------------------------------
 
 
+class SubResult(TypedDict, total=False):
+    """One sub-question's isolated retrieval + sub-answer.
+
+    Produced by a ``subq_worker`` invocation and appended (via the
+    ``operator.add`` reducer on ``AgentState.sub_results``) so parallel
+    workers concatenate their outputs without racing.
+    """
+    sub_question: str
+    sub_answer: str
+    chunks: list          # this sub-question's OWN retrieved chunks
+    doc_aggs: list
+
+
 class AgentState(TypedDict, total=False):
     # Inputs (set once at START)
     messages: list[dict]          # [{role, content}, ...]
+    dialog_system_prompt: str
     max_iterations: int
 
     # Planner outputs
     formalized_question: str
-    intent: str                   # answer|search_kb|web_search|summarize|compare|structured
-    sub_questions: list[str]
+    intent: str                   # answer|search_kb|web_search|summarize|compare|structured|others
+    sub_questions: list[str]      # current desired set (last-write-wins; plan may grow it)
     iteration: int
 
-    # Retrieval progress
+    # Map-reduce over sub-questions (search_kb intent only).
+    # Both use ``operator.add`` so N parallel workers append concurrently.
+    sub_results: Annotated[list[SubResult], operator.add]
+    answered_subqs: Annotated[list[str], operator.add]
+
+    # Retrieval progress (single-shot intents: compare/summarize/web/structured)
     selected_doc_ids: list[str]
     doc_compiled_hints: dict[str, str]     # doc_id → tree/graph outline
     dataset_hint: dict[str, str]           # {skill_outline, dataset_nav}
-    # Cumulative citation pool snapshot copied from RAGTools.kbinfos so a
-    # resume that re-enters ``answer`` can rebuild context without re-running
-    # any retrieval node.
+    # Cumulative citation pool snapshot. For single-shot intents it mirrors
+    # RAGTools.kbinfos; for the fan-out path the ``answer`` node rebuilds it
+    # by merging every worker's ``chunks`` so a resume never re-retrieves.
     kbinfos: dict[str, list]
 
     # Final
@@ -94,16 +132,27 @@ class AgentState(TypedDict, total=False):
     node_errors: list[dict]
 
 
-# Intent → downstream node name. ``answer`` is terminal.
-_INTENT_ROUTES = {
+# Intent → downstream routing KEY (resolved to a node / Send list in
+# ``route_from_plan``). ``search_kb`` fans out; the rest are single-shot.
+_SINGLE_SHOT_ROUTES = {
     "answer": "answer",
-    "search_kb": "select_docs",
+    "others": "others",
     "compare": "select_docs",
     "web_search": "web_search",
     "summarize": "summarize",
     "structured": "structured",
 }
-_VALID_INTENTS = set(_INTENT_ROUTES)
+_VALID_INTENTS = set(_SINGLE_SHOT_ROUTES) | {"search_kb"}
+# Path-map for the plan conditional edge. ``search_kb`` returns a Send list
+# (bypasses the map); everything else returns one of these keys.
+_PLAN_PATH_MAP = {
+    "answer": "answer",
+    "others": "others",
+    "select_docs": "select_docs",
+    "web_search": "web_search",
+    "summarize": "summarize",
+    "structured": "structured",
+}
 
 
 def _messages_to_transcript(messages: list[dict]) -> list[str]:
@@ -182,27 +231,63 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             return {"formalized_question": formalized, "intent": "answer",
                     "iteration": iteration + 1}
 
-        have_evidence = bool((state.get("kbinfos") or {}).get("chunks"))
+        answered = state.get("answered_subqs") or []
+        sub_results = state.get("sub_results") or []
+        have_evidence = bool(sub_results) or bool((state.get("kbinfos") or {}).get("chunks"))
+
+        # B2 re-plan: when sub-question attempts already exist, summarise them
+        # for the planner so it can decide "enough → answer" or "need more
+        # fine-grained sub-questions". On the first pass this block is empty.
+        answered_digest = ""
+        if sub_results:
+            def _sub_answer_status(answer: str) -> str:
+                answer_lc = (answer or "").strip().lower()
+                if not answer_lc:
+                    return "not_answered"
+                if answer_lc.startswith("not_answered"):
+                    return "not_answered"
+                if "doesn't answer" in answer_lc or "does not answer" in answer_lc:
+                    return "not_answered"
+                if "insufficient" in answer_lc or "not enough evidence" in answer_lc:
+                    return "not_answered"
+                return "answered"
+
+            answered_digest = "\n".join(
+                f"- Q: {r.get('sub_question','')}\n"
+                f"  Status: {_sub_answer_status(r.get('sub_answer') or '')}\n"
+                f"  A: {((r.get('sub_answer') or '').strip() or 'NOT_ANSWERED: no answer was produced')[:500]}"
+                for r in sub_results
+            )
+
         planner_system = (
-            "You are the planner of a retrieval agent. Decide the SINGLE next "
-            "step for the question below. Choose ONE intent:\n"
-            "- search_kb: retrieve chunks from the knowledge base\n"
+            "You are the planner of a smart agent. Decide the SINGLE next "
+            "step for the user's request below. Choose ONE intent:\n"
+            "- search_kb: retrieve chunks from the knowledge base (this fans out into parallel sub-questions)\n"
             "- web_search: search the public web (only if KB won't have it)\n"
             "- summarize: the user explicitly asked to summarize one document\n"
             "- compare: the user asked to contrast/diff specific documents\n"
             "- structured: the question is an aggregate/filter over tabular data\n"
+            "- others: ordinary conversation or a request that does not need any tool above\n"
             "- answer: enough evidence already gathered — compose the answer\n\n"
-            "If evidence has ALREADY been retrieved and it is sufficient, choose "
-            "answer. Output ONLY a JSON object: "
-            '{"intent": "...", "sub_questions": ["..."]}. '
-            "sub_questions is optional; include it only when the question bundles "
-            "several independent information needs."
+            "When you choose search_kb, break the question into the minimal set "
+            "of independent sub-questions needed to answer it fully (one element "
+            "if it's a single need). The attempted sub-question block may include "
+            "failed or partial attempts. If an attempt is empty, marked "
+            "NOT_ANSWERED/not_answered, says the evidence is insufficient, or "
+            "only partially answers its question, do NOT choose answer just "
+            "because it was attempted. Instead choose search_kb and decompose "
+            "that unresolved or partial sub-question into smaller, more concrete "
+            "follow-up sub-questions. List ONLY NEW narrower questions; do not "
+            "repeat an already attempted question verbatim. Choose answer only "
+            "when the attempted answers fully cover the original request.\n"
+            "Output ONLY a JSON object: "
+            '{"intent": "...", "sub_questions": ["..."]}.'
         )
         planner_user = (
             f"Question: {formalized}\n"
-            f"Evidence already retrieved: {'yes' if have_evidence else 'no'}\n"
-            f"Iteration: {iteration + 1}/{max_iters}\n\n"
-            "Next step (JSON):"
+            f"Iteration: {iteration + 1}/{max_iters}\n"
+            + (f"\nAttempted sub-questions and answers:\n{answered_digest}\n" if answered_digest else "")
+            + "\nNext step (JSON):"
         )
         try:
             raw = await chat_mdl.async_chat(
@@ -216,18 +301,27 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
         plan = _parse_json_object(raw)
         intent = str(plan.get("intent") or "").strip()
         if intent not in _VALID_INTENTS:
-            # No evidence yet → search; otherwise answer.
             intent = "answer" if have_evidence else "search_kb"
 
-        subs = plan.get("sub_questions")
-        sub_questions = state.get("sub_questions") or []
-        if isinstance(subs, list) and subs and not sub_questions:
-            # Only decompose once; subsequent loops reuse the list.
-            try:
-                sub_questions = await tools.decompose_question(formalized)
-            except Exception:
-                sub_questions = [s for s in subs if isinstance(s, str)]
+        sub_questions = []#list(state.get("sub_questions") or [])
+        planner_subs = [s for s in (plan.get("sub_questions") or []) if isinstance(s, str) and s.strip()]
+        if intent == "search_kb":
+            if not sub_questions and not planner_subs:
+                # First pass, planner gave none → decompose the formalized Q.
+                try:
+                    planner_subs = await tools.decompose_question(formalized)
+                except Exception:
+                    planner_subs = [formalized]
+            for sq in planner_subs:
+                if sq not in sub_questions:
+                    sub_questions.append(sq)
+            if not sub_questions:
+                sub_questions = [formalized]
 
+        logging.info(
+            f"[PLAN{iteration+1}] -> {intent}: {formalized} -> "
+            + "/".join(sub_questions)
+        )
         return {
             "formalized_question": formalized,
             "intent": intent,
@@ -235,8 +329,34 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             "iteration": iteration + 1,
         }
 
-    def route_from_plan(state: AgentState) -> str:
-        return _INTENT_ROUTES.get(state.get("intent") or "answer", "answer")
+    def route_from_plan(state: AgentState):
+        """Route out of ``plan``.
+
+        For ``search_kb`` with un-answered sub-questions, return a list of
+        ``Send`` objects — one per pending sub-question — so LangGraph fans
+        them out to parallel ``subq_worker`` invocations. Everything else
+        returns a single string key resolved by ``_PLAN_PATH_MAP``.
+        """
+        from langgraph.types import Send
+
+        intent = state.get("intent") or "answer"
+        if intent == "search_kb":
+            answered = set(state.get("answered_subqs") or [])
+            pending = [sq for sq in (state.get("sub_questions") or []) if sq not in answered]
+            if pending:
+                fq = state.get("formalized_question") or ""
+                dataset_hint = state.get("dataset_hint") or {}
+                return [
+                    Send("subq_worker", {
+                        "sub_question": sq,
+                        "formalized_question": fq,
+                        "dataset_hint": dataset_hint,
+                    })
+                    for sq in pending
+                ]
+            # Nothing new to run — synthesise what we have.
+            return "answer"
+        return _SINGLE_SHOT_ROUTES.get(intent, "answer")
 
     # ----- select_docs ---------------------------------------------
     async def select_docs_node(state: AgentState) -> dict:
@@ -268,6 +388,7 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             except Exception:
                 logging.exception("select_docs_node: select_documents failed")
 
+        logging.info(f"[SELECT DOC] -> {selected}: {dataset_hint}")
         return {"selected_doc_ids": selected, "dataset_hint": dataset_hint}
 
     async def _select_docs_from_hint(question: str, hint_md: str) -> list[str]:
@@ -303,6 +424,7 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             return []
         if not isinstance(ids, list):
             return []
+        logging.info(f"[SELECT DOC BY HINT] -> {ids}")
         # Keep only ids that literally occur in the outline text.
         return [d for d in ids if isinstance(d, str) and d and d in hint_md]
 
@@ -312,8 +434,6 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
 
         doc_ids = state.get("selected_doc_ids") or []
         hints: dict[str, str] = {}
-        # Resolve each doc's tenant via the bound KBs.
-        tenant_by_kb = {kb.id: tid for tid, kb in zip(tools.tenant_ids, tools.kbs)}
         for doc_id in doc_ids:
             pair = None
             try:
@@ -327,23 +447,97 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             md = await gather_doc_hint(tenant_id, kb_id, doc_id)
             if md:
                 hints[doc_id] = md
+
+        logging.info(f"[LOAD HINT] -> {doc_ids}")
         return {"doc_compiled_hints": hints}
 
-    # ----- retrieve -------------------------------------------------
-    async def retrieve_node(state: AgentState) -> dict:
-        question = state.get("formalized_question") or ""
-        scope = state.get("selected_doc_ids") or None
-        # PR1: classic ES retrieval, doc-scoped when we selected docs. The
-        # compiled-hint-driven chunk pick (spec 5.1) lands in PR2; the hints
-        # are already carried in state so the answer node can surface them.
-        keywords = question
+    # ----- subq_worker (map) ---------------------------------------
+    async def subq_worker(state: dict) -> dict:
+        """Process ONE sub-question end to end, in isolation.
+
+        Runs on a private ``Send`` payload (``sub_question`` +
+        ``formalized_question`` + ``dataset_hint``), retrieves into its OWN
+        ``sink`` (never the shared ``tools.kbinfos``), composes a
+        sub-answer, and appends a :class:`SubResult`. N of these run
+        concurrently; the ``operator.add`` reducers on ``sub_results`` /
+        ``answered_subqs`` concatenate their outputs race-free.
+
+        Note: ``tools.chat_mdl`` is shared across parallel workers. The LLM
+        HTTP calls are stateless; only token-usage accounting may be
+        slightly imprecise under concurrency. Retrieval isolation (the part
+        that matters for correctness) is guaranteed by the per-worker sink.
+        """
+        sub_q = state.get("sub_question") or ""
+        dataset_hint = state.get("dataset_hint") or {}
+
+        # 1. Doc selection scoped to THIS sub-question.
+        selected: list[str] = []
+        hint_md = dataset_hint.get("skill_outline") or dataset_hint.get("dataset_nav") or ""
+        if hint_md:
+            selected = await _select_docs_from_hint(sub_q, hint_md)
+        if not selected:
+            try:
+                picked = await tools.select_documents(sub_q)
+                if isinstance(picked, list):
+                    selected = [d for d in picked if isinstance(d, str)]
+            except Exception:
+                logging.exception("subq_worker: select_documents failed for %r", sub_q)
+
+        # 2. Retrieve into a private pool (concurrency-safe).
+        sink: dict[str, list] = {"chunks": [], "doc_aggs": []}
         try:
-            await tools.search_knowledge_bases(
-                question=question, keywords=keywords, docid_scope=scope,
+            await tools.retrieve_into(
+                question=sub_q, keywords=sub_q,
+                docid_scope=selected or None, sink=sink,
             )
         except Exception:
-            logging.exception("retrieve_node: search_knowledge_bases failed")
-        return {"kbinfos": deepcopy(tools.kbinfos)}
+            logging.exception("subq_worker: retrieve_into failed for %r", sub_q)
+
+        # 3. Compose this sub-question's own answer from its own chunks.
+        sub_answer = await _compose_sub_answer(sub_q, sink)
+
+        logging.info(f"[SUBQ] {sub_q} -> {len(sink.get('chunks', []))} chunks")
+        return {
+            "sub_results": [{
+                "sub_question": sub_q,
+                "sub_answer": sub_answer,
+                "chunks": sink.get("chunks", []),
+                "doc_aggs": sink.get("doc_aggs", []),
+            }],
+            "answered_subqs": [sub_q],
+        }
+
+    async def _compose_sub_answer(sub_q: str, sink: dict) -> str:
+        from rag.prompts.generator import kb_prompt
+
+        try:
+            ctx = kb_prompt(sink, chat_mdl.max_length, 0)
+        except Exception:
+            ctx = []
+        ctx_text = "\n\n".join(ctx) if isinstance(ctx, list) else str(ctx)
+        if not ctx_text.strip():
+            return "NOT_ANSWERED: no relevant evidence was retrieved for this sub-question."
+        system = (
+            "Answer the single question using ONLY the evidence below. Be "
+            "brief and factual — this is an intermediate result that will be "
+            "synthesised with others. If the evidence does not directly answer "
+            "the question, return exactly `NOT_ANSWERED: <short reason>` so "
+            "the planner can decompose the question into smaller follow-ups. "
+            "Answer in the question's language.\n\n"
+            f"# Evidence\n{ctx_text}"
+        )
+        try:
+            ans = await chat_mdl.async_chat(
+                system=system,
+                history=[{"role": "user", "content": f"Question: {sub_q}"}],
+                gen_conf={"temperature": 0.2},
+            )
+        except Exception:
+            logging.exception("_compose_sub_answer: LLM failed for %r", sub_q)
+            return ""
+        if isinstance(ans, tuple):
+            ans = ans[0]
+        return (ans or "").strip()
 
     # ----- web_search ----------------------------------------------
     async def web_search_node(state: AgentState) -> dict:
@@ -352,6 +546,7 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             await tools.web_search(question)
         except Exception:
             logging.exception("web_search_node: web_search failed")
+        logging.info(f"[WEB SEARCH] -> {question}")
         return {"kbinfos": deepcopy(tools.kbinfos)}
 
     # ----- summarize -----------------------------------------------
@@ -370,6 +565,7 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
                 await tools.summarize_document(doc_ids[0])
             except Exception:
                 logging.exception("summarize_node: summarize_document failed")
+        logging.info(f"[SUMMARIZE] -> {doc_ids}")
         return {"selected_doc_ids": doc_ids, "kbinfos": deepcopy(tools.kbinfos)}
 
     # ----- compare -------------------------------------------------
@@ -380,6 +576,7 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
                 await tools.compare_documents(doc_ids)
             except Exception:
                 logging.exception("compare_node: compare_documents failed")
+        logging.info(f"[COMPARE] -> {doc_ids}")
         return {"kbinfos": deepcopy(tools.kbinfos)}
 
     # ----- structured ----------------------------------------------
@@ -389,23 +586,107 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             await tools.search_structured_data(question)
         except Exception:
             logging.exception("structured_node: search_structured_data failed")
+        logging.info(f"[STRUCTURED] -> {question}")
         return {"kbinfos": deepcopy(tools.kbinfos)}
 
-    # ----- answer ---------------------------------------------------
+    # ----- others ---------------------------------------------------
+    async def others_node(state: AgentState) -> dict:
+        """Handle ordinary LLM requests that do not need RAG tools."""
+        messages = [m for m in (state.get("messages") or []) if m.get("role") != "system"]
+        if not messages:
+            messages = [{"role": "user", "content": state.get("formalized_question") or ""}]
+
+        try:
+            tools.kbinfos = {"chunks": [], "doc_aggs": []}
+        except Exception:
+            pass
+
+        system = state.get("dialog_system_prompt") or "You are a helpful assistant."
+        full_answer = ""
+        stream_iter = chat_mdl.async_chat_streamly_delta(
+            system=system,
+            history=messages,
+            gen_conf={"temperature": 0.3},
+        )
+        try:
+            last_state = None
+            async for kind, value, st in _stream_with_think_delta(stream_iter):
+                last_state = st
+                if kind == "marker":
+                    flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
+                    token_queue.put_nowait({"answer": "", "reference": {}, "audio_binary": None, "final": False, **flags})
+                    continue
+                token_queue.put_nowait({"answer": value})
+            full_answer = _extract_visible_answer(last_state.full_text if last_state else "")
+        except Exception:
+            logging.exception("others_node: streaming failed")
+            if not full_answer:
+                full_answer = "I couldn't compose an answer due to an internal error."
+                token_queue.put_nowait({"answer": full_answer})
+
+        logging.info(f"[OTHERS] -> {full_answer[:200]}")
+        return {"final_answer": full_answer, "kbinfos": {"chunks": [], "doc_aggs": []}}
+
+    # ----- answer (reduce) -----------------------------------------
+    def _merge_kbinfos(state: AgentState) -> dict:
+        """Merge every sub-question's chunks + any single-shot kbinfos into
+        one deduped citation pool, and publish it onto ``tools.kbinfos`` so
+        the outer ``rag_agent`` can build references from it.
+
+        Dedup is by chunk ``id`` (falling back to ``chunk_id``) preserving
+        first-seen order so citation indices stay stable.
+        """
+        merged: dict[str, list] = {"chunks": [], "doc_aggs": []}
+        seen_chunks: set = set()
+        seen_docs: set = set()
+
+        def _add(pool: dict) -> None:
+            for c in (pool or {}).get("chunks", []) or []:
+                cid = c.get("id") or c.get("chunk_id") or id(c)
+                if cid in seen_chunks:
+                    continue
+                seen_chunks.add(cid)
+                merged["chunks"].append(c)
+            for d in (pool or {}).get("doc_aggs", []) or []:
+                key = d.get("doc_id") or d.get("doc_name") or id(d)
+                if key in seen_docs:
+                    continue
+                seen_docs.add(key)
+                merged["doc_aggs"].append(d)
+
+        for r in state.get("sub_results") or []:
+            _add({"chunks": r.get("chunks", []), "doc_aggs": r.get("doc_aggs", [])})
+        _add(state.get("kbinfos") or {})
+
+        # Publish for the outer reference builder (single-shot node runs once,
+        # answer runs once — no concurrency here).
+        try:
+            tools.kbinfos = deepcopy(merged)
+        except Exception:
+            pass
+        return merged
+
     async def answer_node(state: AgentState) -> dict:
         from rag.prompts.generator import kb_prompt
 
         question = state.get("formalized_question") or _latest_user_text(state.get("messages") or [])
-        kbinfos = state.get("kbinfos") or {"chunks": [], "doc_aggs": []}
+        kbinfos = _merge_kbinfos(state)
 
-        # Build the grounding context from the CHECKPOINTED evidence, not
-        # from tools.kbinfos — on a resume the tools instance is fresh but
-        # the state carries everything retrieved before the failure.
         try:
             context = kb_prompt(kbinfos, chat_mdl.max_length, 0)
         except Exception:
             context = []
         context_text = "\n\n".join(context) if isinstance(context, list) else str(context)
+
+        # Gather the per-sub-question Q&A so the synthesis can weave them into
+        # one concise, pithy answer to the ORIGINAL formalized question.
+        sub_results = state.get("sub_results") or []
+        subqa_block = ""
+        if sub_results:
+            subqa_block = "\n\n".join(
+                f"### Sub-question: {r.get('sub_question','')}\n{(r.get('sub_answer') or '').strip()}"
+                for r in sub_results if (r.get("sub_answer") or "").strip()
+            )
 
         citation_rules = ""
         try:
@@ -414,70 +695,77 @@ def build_graph(tools, checkpointer, token_queue: "asyncio.Queue"):
             pass
 
         system = (
-            "You are a RAG assistant. Answer the question using ONLY the "
-            "evidence below. Answer in the user's language. If the evidence "
-            "is insufficient, say so plainly. Apply the citation rules "
-            "verbatim.\n\n"
-            f"# Citation rules\n{citation_rules}\n\n"
-            f"# Evidence\n{context_text}"
+            "You are a RAG assistant composing a FINAL answer. You are given "
+            "the original question, the intermediate answers to its "
+            "sub-questions, and the underlying evidence chunks. Synthesise a "
+            "SINGLE concise, pithy answer to the original question — weave the "
+            "sub-answers together, resolve overlaps, and DO NOT just concatenate "
+            "them. Answer in the user's language. If the evidence is "
+            "insufficient, say so plainly. "
+            # "Apply the citation rules verbatim, citing only chunks actually present in the evidence.\n\n"
+            #f"# Citation rules\n{citation_rules}\n\n"
+            + (f"# Sub-question answers\n{subqa_block}\n\n" if subqa_block else "")
+            #+ f"# Evidence\n{context_text}"
         )
-        user = f"Question: {question}"
+        user = f"Original question: {question}\n\nConcise final answer:"
 
-        final = ""
+        full_answer = ""
+        stream_iter = chat_mdl.async_chat_streamly_delta(system=system, history=[{"role": "user", "content": user}], gen_conf={"temperature": 0.3})
         try:
-            async for cumulative in chat_mdl.async_chat_streamly(
-                system=system,
-                history=[{"role": "user", "content": user}],
-                gen_conf={"temperature": 0.3},
-            ):
-                if isinstance(cumulative, str):
-                    # ``async_chat_streamly`` yields the cumulative answer;
-                    # emit only the newly-appended delta.
-                    delta = cumulative[len(final):]
-                    final = cumulative
-                    if delta:
-                        token_queue.put_nowait({"answer": delta})
+            last_state = None
+            async for kind, value, st in _stream_with_think_delta(stream_iter):
+                last_state = st
+                if kind == "marker":
+                    flags = {"start_to_think": True} if value == "<think>" else {"end_to_think": True}
+                    token_queue.put_nowait({"answer": "", "reference": {}, "audio_binary": None, "final": False, **flags})
+                    continue
+                token_queue.put_nowait({"answer": value})
+            full_answer = _extract_visible_answer(last_state.full_text if last_state else "")
         except Exception:
             logging.exception("answer_node: streaming failed")
-            if not final:
-                final = "I couldn't compose an answer due to an internal error."
-                token_queue.put_nowait({"answer": final})
+            if not full_answer:
+                full_answer = "I couldn't compose an answer due to an internal error."
+                token_queue.put_nowait({"answer": full_answer})
 
-        return {"final_answer": final}
+        logging.info(f"[ANSWER] -> {full_answer[:200]}")
+        return {"final_answer": full_answer, "kbinfos": kbinfos}
 
     # ----- wire -----------------------------------------------------
     g = StateGraph(AgentState)
     g.add_node("plan", plan_node)
-    g.add_node("select_docs", select_docs_node)
-    g.add_node("load_hints", load_hints_node)
-    g.add_node("retrieve", retrieve_node)
+    g.add_node("subq_worker", subq_worker)          # search_kb fan-out (map)
+    g.add_node("select_docs", select_docs_node)     # compare path only
+    g.add_node("load_hints", load_hints_node)        # compare path only
     g.add_node("web_search", web_search_node)
     g.add_node("summarize", summarize_node)
     g.add_node("compare", compare_node)
     g.add_node("structured", structured_node)
+    g.add_node("others", others_node)
     g.add_node("answer", answer_node)
 
     g.add_edge(START, "plan")
-    g.add_conditional_edges("plan", route_from_plan, _INTENT_ROUTES)
+    # ``route_from_plan`` returns either a list[Send] (search_kb fan-out) or
+    # one of the path-map keys below. Send lists bypass the path-map.
+    g.add_conditional_edges("plan", route_from_plan, _PLAN_PATH_MAP)
 
-    # Retrieval sub-chain. Both ``search_kb`` and ``compare`` route through
-    # select_docs → load_hints (to gather doc ids + compiled hints). After
-    # hints load, branch on intent: ``compare`` goes to the compare tool
-    # (needs 2+ docs side by side); everything else does ordinary chunk
-    # retrieval. Both loop back to plan for the next decision.
-    def route_after_hints(state: AgentState) -> str:
-        return "compare" if (state.get("intent") == "compare") else "retrieve"
+    # search_kb: every parallel worker loops back to plan (B2). The planner
+    # re-evaluates once all workers of the batch have joined and either
+    # answers or emits follow-up sub-questions (already-answered ones are
+    # filtered by ``answered_subqs``).
+    g.add_edge("subq_worker", "plan")
 
+    # compare: select docs → load hints → compare → plan. (search_kb no
+    # longer uses this chain; it goes through subq_worker.)
     g.add_edge("select_docs", "load_hints")
-    g.add_conditional_edges(
-        "load_hints", route_after_hints,
-        {"compare": "compare", "retrieve": "retrieve"},
-    )
-    g.add_edge("retrieve", "plan")
+    g.add_edge("load_hints", "compare")
+    g.add_edge("compare", "plan")
+
+    # Other single-shot intents loop straight back to plan.
     g.add_edge("web_search", "plan")
     g.add_edge("summarize", "plan")
-    g.add_edge("compare", "plan")
     g.add_edge("structured", "plan")
+
+    g.add_edge("others", END)
     g.add_edge("answer", END)
 
     return g.compile(checkpointer=checkpointer)
@@ -493,6 +781,7 @@ async def run_agentic_rag(
     messages: list[dict],
     thread_id: str,
     max_iterations: int = 4,
+    dialog_system_prompt: str = "",
 ) -> AsyncIterator[dict]:
     """Drive the agentic-RAG graph, yielding SSE-ready frames.
 
@@ -505,6 +794,8 @@ async def run_agentic_rag(
     :param messages: conversation history ``[{role, content}, ...]``.
     :param thread_id: per-turn resume key (e.g. ``f"{conv_id}:{turn}"``).
     :param max_iterations: plan-loop budget.
+    :param dialog_system_prompt: resolved dialog prompt for the direct LLM
+        ``others`` path.
     """
     from rag.advanced_rag.agentic_rag_checkpoint import open_checkpointer
 
@@ -526,12 +817,22 @@ async def run_agentic_rag(
 
     async with open_checkpointer() as checkpointer:
         graph = build_graph(tools, checkpointer, token_queue)
-        config = {"configurable": {"thread_id": thread_id}}
+        # ``recursion_limit`` bounds total supersteps. The B2 loop is
+        # plan → (fan-out workers) → plan → … capped by ``max_iterations``
+        # plan passes; a generous limit avoids tripping on wide fan-outs.
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": max(25, max_iterations * 8),
+        }
         init_state: AgentState = {
             "messages": messages,
+            "dialog_system_prompt": dialog_system_prompt,
             "max_iterations": max_iterations,
             "iteration": 0,
             "kbinfos": {"chunks": [], "doc_aggs": []},
+            "sub_results": [],
+            "answered_subqs": [],
+            "sub_questions": [],
         }
         drive_task = asyncio.create_task(_drive(graph, config, init_state))
         try:

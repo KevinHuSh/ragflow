@@ -20,6 +20,9 @@ import time
 import uuid
 from copy import deepcopy
 
+from api.db.services.tenant_llm_service import TenantLLMService
+from rag.advanced_rag.agentic_rag import RAGTools
+
 logger = logging.getLogger(__name__)
 from datetime import datetime
 from functools import partial
@@ -1815,7 +1818,15 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
     llm_type = TenantLLMService.llm_id2llm_type(dialog.llm_id)
     if llm_type != "chat":
         raise ValueError("rag_agent only supports chat LLMs.")
-    llm_model_config = TenantLLMService.get_model_config(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+
+    if dialog.llm_id:
+        llm_types = get_model_type_by_name(dialog.tenant_id, dialog.llm_id)
+        if "chat" in llm_types:
+            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.CHAT, dialog.llm_id)
+        else:
+            llm_model_config = get_model_config_from_provider_instance(dialog.tenant_id, LLMType.IMAGE2TEXT, dialog.llm_id)
+    else:
+        llm_model_config = get_tenant_default_model_by_type(dialog.tenant_id, LLMType.CHAT)
 
     #attachments = None
     #if "doc_ids" in kwargs:
@@ -1833,6 +1844,33 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         convert_last_user_msg_to_multimodal(msg, image_attachments, factory)
     if attachments_:
         msg[-1]["content"] = msg[-1]["content"] + "\n" + attachments_
+
+    def render_dialog_system_prompt():
+        system_prompt = prompt_config.get("system", "")
+        if not isinstance(system_prompt, str):
+            return ""
+
+        class PromptKwargs(dict):
+            def __missing__(self, key):
+                return " "
+
+        prompt_kwargs = dict(kwargs)
+        prompt_kwargs.setdefault("knowledge", "")
+        for p in prompt_config.get("parameters", []) or []:
+            if not isinstance(p, dict):
+                continue
+            key = p.get("key")
+            if not key or key == "knowledge" or key in prompt_kwargs:
+                continue
+            prompt_kwargs[key] = " "
+
+        try:
+            return system_prompt.format_map(PromptKwargs(prompt_kwargs))
+        except Exception:
+            logging.exception("rag_agent(langgraph): failed to render dialog system prompt; using raw prompt")
+            return system_prompt
+
+    dialog_system_prompt = render_dialog_system_prompt()
 
     async def decorate_answer(answer):
         nonlocal rag_tools, messages
@@ -1861,11 +1899,26 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
     session_id = kwargs.get("session_id") or ""
     thread_id = f"{session_id}:{len(messages)}"
     full_answer = ""
+    start_to_think = False
     try:
-        async for frame in run_agentic_rag(rag_tools, msg, thread_id):
+        async for frame in run_agentic_rag(
+            rag_tools,
+            msg,
+            thread_id,
+            dialog_system_prompt=dialog_system_prompt,
+        ):
+            if frame.get("start_to_think"):
+                start_to_think = True
+                if stream:
+                    yield {"start_to_think": True, "answer": "", "reference": {}, "audio_binary": None, "final": False}
+            if frame.get("end_to_think"):
+                start_to_think = False
+                if stream:
+                    yield {"end_to_think": True, "answer": "", "reference": {}, "audio_binary": None, "final": False}
             if "answer" in frame:
                 delta = frame["answer"] or ""
-                full_answer += delta
+                if not start_to_think:
+                    full_answer += delta
                 if stream:
                     yield {"answer": delta, "reference": {}, "audio_binary": tts(tts_mdl, delta), "final": False}
             elif "error" in frame:

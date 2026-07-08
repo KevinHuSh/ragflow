@@ -28,9 +28,9 @@ a one-time ``setup()`` that creates the checkpoint indices. We derive
 the connection URL from RAGFlow's existing redis config so no extra
 configuration is introduced.
 
-``langgraph-checkpoint-redis`` is an optional dependency: importing this
-module never imports it at module load, so the app still starts when the
-package is absent (the agentic path is feature-flagged off by default).
+``langgraph-checkpoint-redis`` and Redis Search support are optional:
+importing this module never imports the package at module load, and a
+plain Redis server falls back to no checkpoint persistence.
 """
 
 from __future__ import annotations
@@ -38,6 +38,18 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
+
+
+def _is_redis_search_unavailable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "unknown command" in message
+        and (
+            "ft._list" in message
+            or "ft.create" in message
+            or "ft.info" in message
+        )
+    )
 
 
 def _redis_url_from_config() -> str:
@@ -83,20 +95,34 @@ async def open_checkpointer() -> AsyncIterator[Any]:
                 ...
 
     The ``AsyncRedisSaver.from_conn_string`` context manager owns the
-    redis client lifecycle; we call ``setup()`` once inside so the
-    checkpoint indices exist before the first write. Import is local so
-    a missing ``langgraph-checkpoint-redis`` only fails when the agentic
-    path is actually invoked, not at app import time.
+    redis client lifecycle and runs setup. Import is local so a missing
+    ``langgraph-checkpoint-redis`` package, or a plain Redis server
+    without Redis Search commands, only disables checkpoint persistence.
     """
-    from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+    try:
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+    except ModuleNotFoundError:
+        logging.warning(
+            "agentic_rag: langgraph-checkpoint-redis is not installed; "
+            "running without checkpoint persistence"
+        )
+        yield None
+        return
 
     url = _redis_url_from_config()
-    async with AsyncRedisSaver.from_conn_string(url) as saver:
-        try:
-            await saver.asetup()
-        except Exception:
-            # ``asetup`` is idempotent; a failure here is almost always
-            # "indices already exist" from a prior run. Log and proceed —
-            # a genuinely broken redis surfaces on the first write.
-            logging.exception("agentic_rag: checkpointer setup failed (continuing)")
-        yield saver
+    try:
+        async with AsyncRedisSaver.from_conn_string(url) as saver:
+            yield saver
+    except Exception as exc:
+        if _is_redis_search_unavailable(exc):
+            logging.warning(
+                "agentic_rag: Redis checkpointer requires Redis Search "
+                "commands (FT.*), but the configured Redis server does not "
+                "provide them; running without checkpoint persistence"
+            )
+        else:
+            logging.exception(
+                "agentic_rag: Redis checkpointer unavailable; running without "
+                "checkpoint persistence"
+            )
+        yield None
