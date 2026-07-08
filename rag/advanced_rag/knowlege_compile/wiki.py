@@ -1573,6 +1573,9 @@ Description: {kb_description}
 ## Extracted concepts (with mention counts)
 {concepts_summary}
 
+## Extracted topics
+{topics_summary}
+
 ## KB reconciliation results
 {kb_reconciliation}
 
@@ -1585,6 +1588,7 @@ Produce a JSON compilation plan:
       "slug": "concept/example-name",
       "title": "Example Page Title",
       "page_type": "entity | concept | topic",
+      "topic": "short canonical topic name",
       "entity_names": ["entity or concept name covered by this page"],
       "related_kb_pages": ["existing-slug-1"],
       "priority": 1
@@ -1599,6 +1603,10 @@ Rules:
 - For UPDATE, slug MUST be an existing wiki page slug from the KB
   reconciliation list above.
 - page_type is one of: entity | concept | topic. Do NOT use "source".
+- topic is required for every page. Prefer a topic from the extracted
+  topics implied by the entities/concepts. If none fits, create a short
+  canonical topic name in the user's language. For topic pages, topic should
+  usually match the page title.
 
 # Slug format (CRITICAL — every slug must follow this shape exactly)
 - The slug is ``<page_type>/<short-descriptive-name>``. The separator
@@ -1888,6 +1896,7 @@ async def _wiki_resolve_maybe_items(
 async def _wiki_planning_call(
     canonical_entities: list[dict],
     canonical_concepts: list[dict],
+    raw_topics: list,
     reconciliation: dict[str, dict],
     chat_mdl,
     kb_name: str | None,
@@ -1911,6 +1920,9 @@ async def _wiki_planning_call(
     concepts_summary = "\n".join(
         _wiki_format_concept_for_plan(c, reconciliation) for c in sorted_concepts[:200]
     ) or "  (none)"
+    topics_summary = "\n".join(
+        f"  - {t.strip()}" for t in raw_topics[:200] if isinstance(t, str) and t.strip()
+    ) or "  (none)"
 
     kb_lines: list[str] = []
     for name, rec in reconciliation.items():
@@ -1926,6 +1938,7 @@ async def _wiki_planning_call(
         kb_description=kb_description or "(no description)",
         entities_summary=entities_summary,
         concepts_summary=concepts_summary,
+        topics_summary=topics_summary,
         kb_reconciliation=kb_reconciliation,
         target_page_count=target_page_count,
     )
@@ -1947,6 +1960,13 @@ async def _wiki_planning_call(
         return {"pages": [], "estimated_page_count": 0, "compilation_notes": "planner returned non-object"}
     if "pages" not in res or not isinstance(res.get("pages"), list):
         res["pages"] = []
+    for page in res["pages"]:
+        if not isinstance(page, dict):
+            continue
+        topic = page.get("topic")
+        if not isinstance(topic, str) or not topic.strip():
+            fallback = page.get("title") or page.get("slug") or page.get("page_type") or "General"
+            page["topic"] = str(fallback).strip() or "General"
     if "estimated_page_count" not in res:
         res["estimated_page_count"] = len(res["pages"])
     res.setdefault("compilation_notes", "")
@@ -2236,6 +2256,7 @@ async def wiki_plan_from_reduction(
     plan = await _wiki_planning_call(
         canonical_entities=canonical_entities,
         canonical_concepts=canonical_concepts,
+        raw_topics=raw_topics,
         reconciliation=reconciliation,
         chat_mdl=chat_mdl,
         kb_name=kb_name,
@@ -3127,7 +3148,7 @@ async def wiki_refine_from_plan(
         callback: optional ``(progress: float, msg: str)`` callback.
 
     Returns the list of page dicts (one per planned entry). Each page dict
-    has ``slug, title, page_type, action, content_md, summary,
+    has ``slug, title, page_type, topic, action, content_md, summary,
     entity_names, related_kb_pages, source_chunk_ids``.
     """
     # Defensive: some callers accidentally pass the result of
@@ -3301,10 +3322,15 @@ async def wiki_refine_from_plan(
                 source_doc_ids = await _wiki_collect_doc_ids(source_chunk_ids, tenant_id, kb_id)
                 summary = _wiki_extract_summary(content_md_rendered) or title
 
+                topic = plan_item.get("topic")
+                if not isinstance(topic, str) or not topic.strip():
+                    topic = title or slug
+
                 page = {
                     "slug": slug,
                     "title": title,
                     "page_type": page_type,
+                    "topic": topic.strip(),
                     "action": action,
                     # Rendered content (with clickable artifact/{kb_id}/{slug} links) is
                     # what callers and the UI consume; the raw [[slug]] form is
