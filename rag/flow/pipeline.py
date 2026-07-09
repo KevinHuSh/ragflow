@@ -26,11 +26,7 @@ from rag.utils.redis_conn import REDIS_CONN
 
 
 class Pipeline(Graph):
-<<<<<<< HEAD
-    def __init__(self, dsl: str|dict, tenant_id=None, doc_id=None, task_id=None, flow_id=None):
-=======
     def __init__(self, dsl: str | dict, tenant_id=None, doc_id=None, task_id=None, flow_id=None, language=None):
->>>>>>> 237276599 (Add an API to load all the wiki topics)
         if isinstance(dsl, dict):
             dsl = json.dumps(dsl, ensure_ascii=False)
         super().__init__(dsl, tenant_id, task_id)
