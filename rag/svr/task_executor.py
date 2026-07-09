@@ -758,9 +758,6 @@ async def run_dataflow(task: dict):
         assert e, "Pipeline log not found."
         dsl = pipeline_log.dsl
         dataflow_id = pipeline_log.pipeline_id
-<<<<<<< HEAD
-    pipeline = Pipeline(dsl, tenant_id=task["tenant_id"], doc_id=doc_id, task_id=task_id, flow_id=dataflow_id)
-=======
     pipeline = Pipeline(
         dsl,
         tenant_id=task["tenant_id"],
@@ -770,7 +767,6 @@ async def run_dataflow(task: dict):
         language=task.get("language"),
     )
     rag_tokenizer.tokenizer.set_language(task.get("language", "English"))
->>>>>>> 237276599 (Add an API to load all the wiki topics)
     chunks = await pipeline.run(file=task["file"]) if task.get("file") else await pipeline.run()
     if doc_id == CANVAS_DEBUG_DOC_ID:
         get_recording_context().record("dataflow_debug_result", "canvas_debug_mode")

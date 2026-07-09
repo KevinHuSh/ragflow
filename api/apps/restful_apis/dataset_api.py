@@ -596,9 +596,6 @@ async def list_wiki_pages(tenant_id, dataset_id):
 
     try:
         success, result = await dataset_api_service.list_wiki_pages(
-<<<<<<< HEAD
-            dataset_id, tenant_id, page=page, page_size=page_size, page_type=page_type,
-=======
             dataset_id,
             tenant_id,
             page=page,
@@ -635,7 +632,6 @@ async def list_wiki_topics(tenant_id, dataset_id):
             tenant_id,
             page=page,
             page_size=page_size,
->>>>>>> 237276599 (Add an API to load all the wiki topics)
         )
         if success:
             return get_result(data=result)

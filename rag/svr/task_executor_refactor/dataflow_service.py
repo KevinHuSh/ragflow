@@ -110,17 +110,12 @@ class DataflowService:
 
             # Run pipeline
             pipeline = Pipeline(
-<<<<<<< HEAD
-                dsl, tenant_id=ctx.tenant_id, doc_id=doc_id,
-                task_id=task_id, flow_id=dataflow_id
-=======
                 dsl,
                 tenant_id=ctx.tenant_id,
                 doc_id=doc_id,
                 task_id=task_id,
                 flow_id=dataflow_id,
                 language=ctx.language,
->>>>>>> 237276599 (Add an API to load all the wiki topics)
             )
             chunks = await pipeline.run(file=ctx.file) if ctx.file else await pipeline.run()
 
