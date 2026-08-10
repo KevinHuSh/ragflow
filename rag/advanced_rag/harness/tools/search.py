@@ -13,9 +13,56 @@ _LOG = logging.getLogger(__name__)
 # digit-guarded English period (so "3.14" / "v1.2" don't split).
 _SENT_END = re.compile(r"[。！？；!?;]+|(?<!\d)\.(?!\d)")
 
-# Table blocks are kept ATOMIC — never split by sentence terminators — so a
-# whole table counts as one "sentence" for keyword matching / narrowing.
-_HTML_TABLE = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+# Block-level HTML elements and markdown tables are kept ATOMIC — never split by
+# sentence terminators — so a whole table / list / block counts as ONE "sentence"
+# for keyword matching and narrowing (a keyword inside one keeps the whole block).
+_HTML_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>")
+
+# Only BLOCK-level containers are protected. Inline tags (<b>, <i>, <a>, <span>,
+# <em>, <strong>, <code>, ...) are deliberately excluded so ordinary prose that
+# contains inline formatting still splits into sentences normally.
+_HTML_BLOCK_TAGS = {
+    "table",
+    "thead",
+    "tbody",
+    "tfoot",
+    "tr",
+    "td",
+    "th",
+    "caption",
+    "colgroup",
+    "ul",
+    "ol",
+    "li",
+    "dl",
+    "dt",
+    "dd",
+    "div",
+    "p",
+    "pre",
+    "blockquote",
+    "section",
+    "article",
+    "aside",
+    "nav",
+    "main",
+    "figure",
+    "figcaption",
+    "header",
+    "footer",
+    "address",
+    "details",
+    "summary",
+    "form",
+    "fieldset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+}
+
 # Markdown table: a header row with a pipe, a separator row of dashes/colons/
 # pipes, then zero+ body rows with a pipe.
 _MD_TABLE = re.compile(
@@ -26,15 +73,51 @@ _MD_TABLE = re.compile(
 )
 
 
+def _html_block_spans(text: str) -> list[tuple[int, int]]:
+    """Outermost balanced block-level HTML element spans (nesting-aware).
+
+    Uses a tag stack (not a regex) so nested elements (e.g. a ``<table>`` with
+    ``<td>``s, or nested ``<div>``s) yield ONE span for the outermost element and
+    are never truncated at the first close tag the way a non-greedy regex would.
+    Unclosed / stray tags are ignored (that region just falls back to plain
+    sentence splitting).
+    """
+    spans: list[tuple[int, int]] = []
+    stack: list[tuple[str, int]] = []
+    for m in _HTML_TAG.finditer(text):
+        name = m.group(2).lower()
+        if name not in _HTML_BLOCK_TAGS:
+            continue
+        if m.group(1):  # closing tag </name>
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][0] == name:
+                    start = stack[i][1]
+                    del stack[i:]
+                    if not stack:  # closed an outermost block
+                        spans.append((start, m.end()))
+                    break
+            # a stray </name> with no matching open is ignored
+        elif not m.group(3).rstrip().endswith("/"):  # opening (skip self-closing)
+            stack.append((name, m.start()))
+    return spans
+
+
 def _protected_spans(text: str) -> list[tuple[int, int]]:
-    """Non-overlapping ``(start, end)`` spans of table blocks, in order."""
-    spans = [(m.start(), m.end()) for m in _HTML_TABLE.finditer(text)]
+    """Non-overlapping ``(start, end)`` spans kept atomic, in order.
+
+    Covers block-level HTML elements and markdown tables; overlapping spans are
+    merged (unioned) so a match that straddles two is never split.
+    """
+    spans = _html_block_spans(text)
     spans += [(m.start(), m.end()) for m in _MD_TABLE.finditer(text)]
     spans.sort()
     merged: list[tuple[int, int]] = []
     last_end = -1
     for s, e in spans:
-        if s < last_end:  # overlaps an already-kept span -> skip
+        if s < last_end:  # overlaps an already-kept span -> union it in
+            if e > last_end:
+                merged[-1] = (merged[-1][0], e)
+                last_end = e
             continue
         merged.append((s, e))
         last_end = e
@@ -61,8 +144,10 @@ def _split_plain(text: str) -> list[str]:
 def _split_sentences(text: str) -> list[str]:
     """Split ``text`` into sentences, keeping each terminator attached.
 
-    Table blocks — HTML ``<table>...</table>`` and markdown tables — are treated
-    as a single atomic sentence and are never split internally.
+    Block-level HTML elements (``<table>``, ``<div>``, ``<p>``, ``<ul>``, ... —
+    see :data:`_HTML_BLOCK_TAGS`) and markdown tables are treated as a single
+    atomic sentence and are never split internally, so a keyword falling inside
+    one keeps the whole block together.
     """
     if not text:
         return []

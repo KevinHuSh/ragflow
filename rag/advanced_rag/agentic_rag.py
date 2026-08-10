@@ -44,6 +44,7 @@ from common import settings
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string
 from rag.advanced_rag.agentic_rag_graph import _split_think_stream
+from rag.advanced_rag.keyword_agentic_graph import run_keyword_agentic_rag
 from rag.app.tag import label_question
 from rag.llm.tool_decorator import tool
 from rag.prompts.generator import (
@@ -137,6 +138,12 @@ class RAGTools:
         # want a tool surface can do ``chat_mdl.bind_tools(tools=rag_tools.tools)``.
         self.tools = [self.rag, self.summarize_document]
 
+        # One `rag` run per user turn. The `rag` graph decomposes the question
+        # internally, so the outer LLM must not split it and call `rag` multiple
+        # times. The first call caches its answer; later calls this turn are
+        # short-circuited to it instead of re-running the whole pipeline.
+        self._rag_answer: str | None = None
+
     # ------------------------------------------------------------------ #
     # Capability flags / cheap introspection
     # ------------------------------------------------------------------ #
@@ -186,11 +193,12 @@ class RAGTools:
         return (
             "You are a smart agent. For any question that needs "
             "evidence from the knowledge bases or the web, call the `rag` tool "
-            "with a self-contained question — it runs the full search-and-answer "
-            "pipeline and returns a cited answer.\n"
-            "After the `rag` tool returns, do not call `rag` again for the same "
-            "user question. Use the returned cited answer as the final answer "
-            "unless the user explicitly asks a new question.\n"
+            "EXACTLY ONCE with the user's COMPLETE question, verbatim.\n"
+            "The `rag` pipeline decomposes the question into sub-questions and "
+            "searches internally, so you must NOT split the question into parts, "
+            "and you must NOT call `rag` more than once for one user question.\n"
+            "After `rag` returns, use its cited answer as your final answer; do "
+            "not call `rag` again unless the user asks a genuinely new question.\n"
             f"{summarize_line}"
             "Do not invent facts and do not fabricate document IDs."
         )
@@ -570,7 +578,13 @@ class RAGTools:
 
         :returns: the composed answer with inline citation markers.
         """
-        from rag.advanced_rag.agentic_rag_graph import run_agentic_rag
+
+        # Hard guard: run the pipeline at most once per user turn. If the outer
+        # LLM tries to decompose the question and call `rag` again, hand back the
+        # first answer with a directive to stop instead of re-running.
+        if self._rag_answer is not None:
+            logging.info("[rag] Already answered this turn; short-circuiting a repeat call.")
+            return "NOTE: `rag` already ran for this user question and searches/decomposes internally. Do NOT call `rag` again for this question — answer from the result below.\n\n" + self._rag_answer
 
         if self.tool_started_sink is not None:
             self.tool_started_sink()
@@ -589,13 +603,14 @@ class RAGTools:
             }
         messages = [{"role": "user", "content": question}] if question else []
         final = ""
-        async for kind, delta in _split_think_stream(run_agentic_rag(self, messages)):
+        async for kind, delta in _split_think_stream(run_keyword_agentic_rag(self, messages)):
             if kind == "answer":
                 final += delta
             if self.answer_sink is not None:
                 self.answer_sink(delta, kind == "think")
         for p, r in [(r"\(\**(ID:\d)\**\)", "[\1]")]:
             final = re.sub(p, r, final)
+        self._rag_answer = final
         return final
 
     @tool
