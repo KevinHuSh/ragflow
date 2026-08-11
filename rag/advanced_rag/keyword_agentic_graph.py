@@ -18,7 +18,7 @@
 
 Flow (each iteration works over a set of sub-questions):
 
-    keywords → retrieve_docs → doc_keywords → retrieve_chunks → summarize
+    keywords → retrieve_docs → retrieve_chunks → summarize
         → think ─(enough | max_iter | no new sub-qs)→ answer
                   └────────(else: think's next sub-questions)────────→ retrieve_docs
 
@@ -30,11 +30,10 @@ Design rules:
 * ``keywords`` decomposes the question into sub-questions, each with its own
   keywords + synonyms. Everything downstream is paired to a sub-question.
 * ``retrieve_docs`` finds candidate documents per sub-question (via ``doc_aggs``).
-  ``doc_keywords`` (one batched LLM call) keeps, per sub-question, only the docs
-  relevant to *that* sub-question with tailored keywords.
-* ``retrieve_chunks`` pulls chunks from those docs and, gated by
-  ``enable_snippets``, narrows them to keyword sentences inline (so a sub-q's
-  chunks already hold the snippet content).
+* ``retrieve_chunks`` pulls chunks with the sub-question's keywords, scoped to
+  that sub-question's candidate documents, and — gated by ``enable_snippets`` —
+  narrows them to keyword sentences inline (so a sub-q's chunks already hold the
+  snippet content).
 * ``summarize`` summarizes each sub-question over its own chunks.
 * ``think`` judges the accumulated summaries against the ORIGINAL question and,
   if short, emits the missing info as the next sub-questions + keywords.
@@ -46,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+from collections import defaultdict
 import json
 import logging
 import re
@@ -79,36 +79,69 @@ Do not guess a day/month order for ambiguous numeric dates."""
 _KEYWORDS_SYSTEM = (
     """You break a question into the sub-questions needed to answer it.
 For EACH sub-question, list the best search keywords AND their closest / most-likely synonyms.
+Each sub-question's "keywords" list MUST contain AT MOST 3 terms — choose the 3 most
+distinctive/relevant terms (this cap includes any date variants: pick the 3 forms most
+likely to appear in the sources).
+A standalone number or serial of digits (an ID, code, year, or numeric date form) is a
+strong keyword on its own: keep it as its OWN separate term. Never glue a number together
+with other words into a single keyword term (e.g. use "1344259" as one term, not
+"Patent 1344259").
+Split the sub-questions into two groups:
+
+1. "subquestions" — answerable NOW from the original question alone. Rewrite references
+   such as "that city", "the person", "it", "the former" as the full entity name or a
+   precise identifying description, and repeat any ranking/date/location condition so the
+   sub-question is self-contained. Prefer this whenever the condition can be *described*
+   without knowing the answer.
+   e.g. "Which US city was 50th most populous by 2023 estimate population?" — answerable now.
+
+2. "pending" — a hop that genuinely needs the ANSWER of a group-1 sub-question (not just a
+   description) before it can be searched. Write it as a template with the literal
+   placeholder <ANSWER>, and set "depends_on" to the 0-based INDEX (into "subquestions") of
+   the sub-question whose answer fills the placeholder.
+   e.g. {"question_template": "When was <ANSWER> founded?", "keywords": ["founded"],
+         "depends_on": 0}  — resolved after subquestion 0 returns the city name.
+
+Only use a pending hop when the description cannot stand in for the value. Independent
+facts (e.g. "When did Frank Fox receive UK Patent 1344259?") stay in group 1.
 """
     + _DATE_NORMALIZATION_SYSTEM
     + """
 Output ONLY JSON, no prose, no code fences:
-{"subquestions": [{"question": "<sub-question>", "keywords": ["term or synonym", ...]}, ...]}"""
+{"subquestions": [{"question": "<sub-question>", "keywords": ["term or synonym", ...]}, ...],
+ "pending": [{"question_template": "... <ANSWER> ...", "keywords": ["..."], "depends_on": 0}, ...]}"""
 )
 
-_DOC_KEYWORDS_SYSTEM = """You are given several sub-questions, and for each a list of candidate documents (id + title).
-For EACH sub-question, keep ONLY the documents whose title suggests they can help answer THAT sub-question,
-and for each kept document give the best keywords to find the answer inside it. Drop irrelevant documents.
-Output ONLY JSON, no prose, no code fences:
-{"subquestions": [{"id": "<sub-question id>", "docs": [{"doc_id": "<id>", "keywords": ["...", ...]}, ...]}, ...]}"""
-
 _SUMMARIZE_SYSTEM = """You are given a sub-question and snippets retrieved for it.
-Summarize ONLY the facts in the snippets that help answer the sub-question.
-Be concise and factual; do not speculate or add outside knowledge. If nothing helps, say "No useful evidence."."""
+Summarize ONLY the facts in the snippets that help answer the sub-question; be concise and
+factual, do not speculate or add outside knowledge.
+Also extract "answer": the SINGLE concrete value this sub-question resolves to (an entity
+name, number, date, ...), or null if the snippets do not resolve it. This value may be
+substituted into a later dependent sub-question, so keep it short and exact.
+Output ONLY JSON, no prose, no code fences:
+{"summary": "<concise factual summary, or 'No useful evidence.'>", "answer": "<value or null>"}"""
 
-_THINK_SYSTEM = """You are given the ORIGINAL question and the evidence summarized for each sub-question so far.
+_THINK_SYSTEM = """You are given the ORIGINAL question and the evidence (with the concrete answer)
+summarized for each sub-question so far. Sub-questions whose answer depends on a still-unknown
+value are resolved automatically and are NOT your job.
 Decide whether the collected evidence is ENOUGH to answer the ORIGINAL question directly.
-If it is NOT enough, state what is missing and propose the next sub-questions (each with keywords + synonyms)
-that would fill the gap.
+If it is NOT enough, state what is missing and, ONLY for genuinely new gaps, propose:
+- "next_subquestions": self-contained sub-questions answerable from the ORIGINAL question and the
+  facts already found (repeat full entity names / conditions; no "that city", "it", "the former"), and
+- "next_pending": deferred hops that need a group-1 answer first — a "<ANSWER>" template plus
+  "depends_on" = the 0-based INDEX into "next_subquestions".
 When any next sub-question contains a date, expand it using the same date-normalization rules as the keyword step.
 Output ONLY JSON, no prose, no code fences:
 {"sufficient": true/false, "missing": "<what is still missing, or empty>",
- "next_subquestions": [{"question": "<sub-question>", "keywords": ["...", ...]}, ...]}"""
+ "next_subquestions": [{"question": "<sub-question>", "keywords": ["...", ...]}, ...],
+ "next_pending": [{"question_template": "... <ANSWER> ...", "keywords": ["..."], "depends_on": 0}, ...]}"""
 
 
 class KwAgenticState(TypedDict, total=False):
     question: str  # original Q (never changes)
-    subquestions: list  # THIS iteration's sub-questions (enriched in place)
+    subquestions: list  # THIS iteration's answerable sub-questions (enriched in place)
+    pending: list  # deferred hops: {id, question_template ("<ANSWER>"), keywords, depends_on: subq_id}
+    resolved: dict  # subq_id -> the concrete answer that sub-question resolved to
     chunks: list  # accumulated citation pool (union, dedup by id)
     evidences: list  # accumulated: [{iteration, subq_id, subq, summary}]
     iteration: int
@@ -239,12 +272,15 @@ def _doc_aggs_from(chunks: list[dict]) -> list[dict]:
 def _mk_subquestions(items, iteration: int) -> list[dict]:
     """Build fresh sub-question records from LLM ``[{question, keywords}]`` items."""
     out: list[dict] = []
+    seen: set[str] = set()
     for i, it in enumerate(items or []):
         if not isinstance(it, dict):
             continue
         q = str(it.get("question") or "").strip()
-        if not q:
+        key = _norm(q)
+        if not key or key in seen:
             continue
+        seen.add(key)
         kws = ", ".join(str(k).strip() for k in (it.get("keywords") or []) if str(k).strip())
         out.append(
             {
@@ -252,9 +288,9 @@ def _mk_subquestions(items, iteration: int) -> list[dict]:
                 "question": q,
                 "keywords": kws or q,
                 "candidate_docs": [],
-                "doc_keywords": {},
                 "chunks": [],
                 "summary": "",
+                "answer": None,  # concrete resolved value, filled by summarize
             }
         )
         if len(out) >= _MAX_SUBQUESTIONS:
@@ -262,11 +298,70 @@ def _mk_subquestions(items, iteration: int) -> list[dict]:
     return out
 
 
+def _mk_pending(items, subqs: list[dict], iteration: int) -> list[dict]:
+    """Build deferred-hop records. ``depends_on`` (a 0-based index into ``subqs``)
+    is mapped to that sub-question's id; items without a ``<ANSWER>`` placeholder
+    or a valid dependency are dropped.
+    """
+    out: list[dict] = []
+    for i, it in enumerate(items or []):
+        if not isinstance(it, dict):
+            continue
+        tmpl = str(it.get("question_template") or "").strip()
+        dep = it.get("depends_on")
+        if not tmpl or "<ANSWER>" not in tmpl or not isinstance(dep, int) or not (0 <= dep < len(subqs)):
+            continue
+        kws = ", ".join(str(k).strip() for k in (it.get("keywords") or []) if str(k).strip())
+        out.append(
+            {
+                "id": f"p{iteration}_{i}",
+                "question_template": tmpl,
+                "keywords": kws,
+                "depends_on": subqs[dep]["id"],
+            }
+        )
+    return out
+
+
+def _dedupe_subquestions(subquestions: list[dict]) -> list[dict]:
+    """Keep the first occurrence of each normalized question in a batch."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for subquestion in subquestions:
+        key = _norm(subquestion.get("question", ""))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(subquestion)
+    return out
+
+
+def _resolve_pending(pending, resolved: dict, iteration: int) -> tuple[list[dict], list[dict]]:
+    """Substitute resolved answers into pending hops whose dependency is known.
+
+    Returns ``(ready_subquestions, still_pending)`` — a pending hop becomes a
+    concrete, answerable sub-question once ``resolved`` holds its dependency's
+    answer; otherwise it stays pending for a later round.
+    """
+    ready_items: list[dict] = []
+    still: list[dict] = []
+    for p in pending or []:
+        val = resolved.get(p.get("depends_on"))
+        if val:
+            q = p["question_template"].replace("<ANSWER>", val)
+            kws = [k.strip() for k in (p.get("keywords") or "").split(",") if k.strip()]
+            kws.append(val)  # the resolved value is itself a strong keyword
+            ready_items.append({"question": q, "keywords": kws[:3]})
+        else:
+            still.append(p)
+    return _mk_subquestions(ready_items, iteration), still
+
+
 def build_keyword_agentic_graph(
     tools,
     token_queue: asyncio.Queue,
     gen_conf: dict | None = None,
-    max_iterations: int = 3,
+    max_iterations: int = 12,
     enable_snippets: bool = True,
 ):
     """Compile the sub-question-driven iterative search graph.
@@ -324,11 +419,14 @@ def build_keyword_agentic_graph(
         subqs = _mk_subquestions(parsed.get("subquestions"), 0)
         if not subqs:  # fall back to the whole question as a single sub-q
             subqs = _mk_subquestions([{"question": q, "keywords": [q]}], 0)
-        _LOG.info("[Keywords] %d sub-question(s).", len(subqs))
+        pending = _mk_pending(parsed.get("pending"), subqs, 0)
+        _LOG.info("[Keywords] %d sub-question(s), %d deferred hop(s).", len(subqs), len(pending))
         for subq in subqs:
             _LOG.info("[Sub-Q & Keywords]: %s -> %s", subq["question"], subq["keywords"])
+        for p in pending:
+            _LOG.info("[Pending hop]: %s (needs %s)", p["question_template"], p["depends_on"])
 
-        return {"subquestions": subqs, "iteration": 0, "chunks": [], "evidences": []}
+        return {"subquestions": subqs, "pending": pending, "resolved": {}, "iteration": 0, "chunks": [], "evidences": []}
 
     # ── Node 2: retrieve candidate docs per sub-question (no LLM) ──
     async def retrieve_docs_node(state: KwAgenticState) -> dict:
@@ -337,81 +435,52 @@ def build_keyword_agentic_graph(
 
         async def _one(sq: dict) -> list:
             try:
-                kbinfos = await _retrieve(sq["keywords"] or sq["question"], _DOC_TOP_N, aggs=True, doc_ids=scoped)
+                kbinfos = await _retrieve(sq["keywords"] or sq["question"], _DOC_TOP_N, aggs=False, doc_ids=scoped)
             except Exception:
                 _LOG.exception("[Retrieve docs] failed for sub-q %s", sq["id"])
                 return []
-            docs = []
-            for d in (kbinfos.get("doc_aggs") or [])[:_DOCS_PER_SUBQ]:
-                did = d.get("doc_id")
-                if did:
-                    docs.append({"doc_id": did, "docnm": d.get("doc_name") or d.get("docnm_kwd") or ""})
+            docs = defaultdict(int)
+            for ck in (kbinfos.get("chunks") or [])[:_DOCS_PER_SUBQ]:
+                did = ck.get("doc_id", "")
+                docnm = ck.get("doc_name") or ck.get("docnm_kwd") or ""
+                k = did + "\t" + docnm
+                if docnm:
+                    docs[k] += 1
             return docs
 
         results = await asyncio.gather(*[_one(sq) for sq in subqs])
         for sq, docs in zip(subqs, results):
-            sq["candidate_docs"] = docs
+            docs = sorted(docs.items(), key=lambda x: x[1] * -1)
+            sq["candidate_docs"] = [{"doc_id": d[0].split("\t")[0], "docnm": d[0].split("\t")[1]} for d in docs[:2]]
         _LOG.info("[Retrieve docs] candidate docs per sub-q: %s", [len(sq["candidate_docs"]) for sq in subqs])
         return {"subquestions": subqs}
 
-    # ── Node 3: keep only relevant docs per sub-question (batched LLM call) ──
-    async def doc_keywords_node(state: KwAgenticState) -> dict:
-        subqs = state.get("subquestions") or []
-        blocks = []
-        for sq in subqs:
-            if not sq["candidate_docs"]:
-                continue
-            listing = "\n".join(f"    - {d['doc_id']}: {d['docnm']}" for d in sq["candidate_docs"])
-            blocks.append(f"[{sq['id']}] {sq['question']}\n{listing}")
-        if not blocks:
-            return {"subquestions": subqs}
-        user = "Sub-questions and their candidate documents:\n\n" + "\n\n".join(blocks) + "\n\nOutput JSON:"
-        parsed = await _llm_json(_DOC_KEYWORDS_SYSTEM, user)
-
-        by_id = {sq["id"]: sq for sq in subqs}
-        for entry in parsed.get("subquestions") or []:
-            sq = by_id.get(entry.get("id"))
-            if not sq:
-                continue
-            valid = {d["doc_id"] for d in sq["candidate_docs"]}
-            pairs: dict[str, str] = {}
-            for p in entry.get("docs") or []:
-                did = p.get("doc_id")
-                if did in valid:
-                    kws = ", ".join(str(k).strip() for k in (p.get("keywords") or []) if str(k).strip())
-                    pairs[did] = kws or sq["keywords"]
-            sq["doc_keywords"] = pairs
-        _LOG.info("[Doc keywords] relevant docs per sub-q: %s", [len(sq["doc_keywords"]) for sq in subqs])
-        return {"subquestions": subqs}
-
-    # ── Node 4: retrieve chunks per sub-q + optional snippet narrowing (no LLM) ──
+    # ── Node 3: retrieve chunks per sub-q, scoped to its candidate docs, with
+    #    optional snippet narrowing (no LLM) ──
     async def retrieve_chunks_node(state: KwAgenticState) -> dict:
         subqs = state.get("subquestions") or []
 
-        async def _one_doc(doc_id: str, kw: str) -> list:
+        async def _one(sq: dict) -> list:
+            doc_ids = [d["doc_id"] for d in (sq.get("candidate_docs") or []) if d.get("doc_id")]
+            if not doc_ids:
+                return []
             try:
-                kbinfos = await _retrieve(kw, _CHUNKS_PER_DOC, aggs=False, doc_ids=[doc_id])
+                kbinfos = await _retrieve(sq["keywords"] or sq["question"], _CHUNKS_PER_DOC * len(doc_ids), aggs=False, doc_ids=doc_ids)
                 return kbinfos.get("chunks") or []
             except Exception:
-                _LOG.exception("[Retrieve chunks] failed for doc=%s", doc_id)
+                _LOG.exception("[Retrieve chunks] failed for sub-q %s", sq["id"])
                 return []
 
-        for sq in subqs:
-            pairs = sq.get("doc_keywords") or {}
-            if not pairs:
-                sq["chunks"] = []
-                continue
-            per_doc = await asyncio.gather(*[_one_doc(did, kw or sq["keywords"]) for did, kw in pairs.items()])
-            chunks = [c for sub in per_doc for c in sub]
-            if enable_snippets:
-                chunks = _narrow_by_keywords(chunks, sq["keywords"])  # narrows content, drops keyword-less
-            sq["chunks"] = chunks
+        results = await asyncio.gather(*[_one(sq) for sq in subqs])
 
-        # Union every sub-q's chunks into the citation pool (dedup by id, stable order).
+        # Narrow (if enabled) and union into the citation pool (dedup by id).
         pool = list(state.get("chunks") or [])
         seen = {_chunk_id(c) for c in pool}
-        for sq in subqs:
-            for c in sq["chunks"]:
+        for sq, chunks in zip(subqs, results):
+            if enable_snippets:
+                chunks = _narrow_by_keywords(chunks, sq["keywords"])
+            sq["chunks"] = chunks
+            for c in chunks:
                 cid = _chunk_id(c)
                 if cid not in seen:
                     seen.add(cid)
@@ -424,37 +493,65 @@ def build_keyword_agentic_graph(
         subqs = state.get("subquestions") or []
         it = state.get("iteration", 0)
 
-        async def _one(sq: dict) -> str:
+        async def _one(sq: dict) -> dict:
             if not sq["chunks"]:
-                return ""
-            snippets_text = "\n\n".join((c.get("content_with_weight") or c.get("content") or "")[:800] for c in sq["chunks"][:_SUMMARY_SNIPPETS])
-            user = f"Sub-question:\n{sq['question']}\n\nSnippets:\n{snippets_text}\n\nSummary:"
-            return await _llm_text(_SUMMARIZE_SYSTEM, user)
+                return {"summary": "", "answer": None}
+            snippets_text = "\n\n".join((c.get("content_with_weight") or c.get("content") or "") for c in sq["chunks"][:_SUMMARY_SNIPPETS])
+            user = f"Sub-question:\n{sq['question']}\n\nSnippets:\n{snippets_text}\n\nOutput JSON:"
+            parsed = await _llm_json(_SUMMARIZE_SYSTEM, user)
+            ans = parsed.get("answer")
+            ans = str(ans).strip() if ans not in (None, "", "null", "None") else None
+            return {"summary": str(parsed.get("summary") or "").strip(), "answer": ans}
 
-        summaries = await asyncio.gather(*[_one(sq) for sq in subqs])
+        results = await asyncio.gather(*[_one(sq) for sq in subqs])
         evidences = list(state.get("evidences") or [])
-        for sq, summary in zip(subqs, summaries):
-            sq["summary"] = summary
-            if summary:
-                evidences.append({"iteration": it, "subq_id": sq["id"], "subq": sq["question"], "summary": summary})
-        _LOG.info("[Summarize] stored %d sub-question summary(ies) at iteration %d.", sum(1 for s in summaries if s), it)
-        return {"subquestions": subqs, "evidences": evidences}
+        resolved = dict(state.get("resolved") or {})
+        for sq, r in zip(subqs, results):
+            sq["summary"] = r["summary"]
+            sq["answer"] = r["answer"]
+            if r["answer"]:
+                resolved[sq["id"]] = r["answer"]
+            if r["summary"]:
+                evidences.append({"iteration": it, "subq_id": sq["id"], "subq": sq["question"], "summary": r["summary"], "answer": r["answer"]})
+        _LOG.info("[Summarize] stored %d summary(ies), %d resolved answer(s) at iteration %d.", sum(1 for r in results if r["summary"]), sum(1 for r in results if r["answer"]), it)
+        return {"subquestions": subqs, "evidences": evidences, "resolved": resolved}
 
     # ── Node 6: think — sufficient vs original Q, else next sub-questions (LLM) ──
     async def think_node(state: KwAgenticState) -> dict:
         evidences = state.get("evidences") or []
-        ev_text = "\n\n".join(f"[{e['subq']}]\n{e['summary']}" for e in evidences) or "(no evidence yet)"
+        resolved = dict(state.get("resolved") or {})
+        pending = list(state.get("pending") or [])
+        ev_text = "\n\n".join(f"[{e['subq']}] (answer: {e.get('answer') or 'n/a'})\n{e['summary']}" for e in evidences) or "(no evidence yet)"
         user = f"Original question:\n{state.get('question') or ''}\n\nEvidence per sub-question:\n{ev_text}\n\nOutput JSON:"
         parsed = await _llm_json(_THINK_SYSTEM, user)
         sufficient = bool(parsed.get("sufficient"))
         it = state.get("iteration", 0) + 1
 
-        # Next sub-questions, minus any already asked (dedup by normalized text).
+        # 1. Substitute newly-resolved answers into pending hops → answerable now.
+        ready_subqs, still_pending = _resolve_pending(pending, resolved, it)
+
+        # 2. think's own new sub-questions (deduped) + any new deferred hops it adds.
         asked = {_norm(e["subq"]) for e in evidences}
-        fresh = [it2 for it2 in (parsed.get("next_subquestions") or []) if isinstance(it2, dict) and _norm(it2.get("question", "")) not in asked]
-        next_subqs = _mk_subquestions(fresh, it)
-        _LOG.info("[Think] iteration %d → sufficient=%s; %d new sub-question(s). Missing: %s", it, sufficient, len(next_subqs), _snip(parsed.get("missing")))
-        return {"sufficient": sufficient, "subquestions": next_subqs, "iteration": it}
+        fresh = [x for x in (parsed.get("next_subquestions") or []) if isinstance(x, dict) and _norm(x.get("question", "")) not in asked]
+        new_subqs = _mk_subquestions(fresh, it)
+        new_pending = _mk_pending(parsed.get("next_pending"), new_subqs, it)
+
+        next_subqs = _dedupe_subquestions(ready_subqs + new_subqs)
+        next_pending = still_pending + new_pending
+        _LOG.info(
+            "[Think] iteration %d → sufficient=%s; %d ready-from-pending + %d new sub-q(s), %d hop(s) still pending. Missing: %s",
+            it,
+            sufficient,
+            len(ready_subqs),
+            len(new_subqs),
+            len(next_pending),
+            _snip(parsed.get("missing")),
+        )
+        for n in next_subqs:
+            _LOG.info("[Think] iteration(%d) sub-q → %s", it, n.get("question"))
+        for n in next_pending:
+            _LOG.info("[Think] iteration(%d) hop → %s", it, n.get("question_template"))
+        return {"sufficient": sufficient, "subquestions": next_subqs, "pending": next_pending, "resolved": resolved, "iteration": it}
 
     # ── Node 7: brief, cited answer (LLM, streamed) ──
     async def answer_node(state: KwAgenticState) -> dict:
@@ -466,7 +563,21 @@ def build_keyword_agentic_graph(
 
         tools.kbinfos = {"chunks": pool, "doc_aggs": _doc_aggs_from(pool)}
         evidence_blocks = kb_prompt(tools.kbinfos, tools.chat_mdl.max_length)
-        evidence = "\n".join(evidence_blocks) if isinstance(evidence_blocks, list) else str(evidence_blocks)
+        evidence_blocks = evidence_blocks if isinstance(evidence_blocks, list) else [str(evidence_blocks)]
+
+        # Prepend the accumulated per-sub-question findings so the final answer
+        # sees the distilled evidence too (uncited context; [ID:n] citations still
+        # come from the chunk blocks below).
+        findings = []
+        for e in state.get("evidences") or []:
+            if not e.get("summary"):
+                continue
+            ans = e.get("answer")
+            findings.append(f"- {e['subq']}" + (f" (answer: {ans})" if ans else "") + f": {e['summary']}")
+        if findings:
+            evidence_blocks = ["Research findings per sub-question:\n" + "\n".join(findings)] + evidence_blocks
+
+        evidence = "\n".join(evidence_blocks)
         rules = citation_prompt(tools.user_defined_prompts).strip()
         system = FINAL_ANSWER_SYSTEM.format(cite_rules=rules)
         user = f"Question:\n{state.get('question') or ''}\n\nEvidence:\n{evidence}"
@@ -491,7 +602,6 @@ def build_keyword_agentic_graph(
     g = StateGraph(KwAgenticState)
     g.add_node("keywords", keywords_node)
     g.add_node("retrieve_docs", retrieve_docs_node)
-    g.add_node("doc_keywords", doc_keywords_node)
     g.add_node("retrieve_chunks", retrieve_chunks_node)
     g.add_node("summarize", summarize_node)
     g.add_node("think", think_node)
@@ -499,8 +609,7 @@ def build_keyword_agentic_graph(
 
     g.add_edge(START, "keywords")
     g.add_edge("keywords", "retrieve_docs")
-    g.add_edge("retrieve_docs", "doc_keywords")
-    g.add_edge("doc_keywords", "retrieve_chunks")
+    g.add_edge("retrieve_docs", "retrieve_chunks")
     g.add_edge("retrieve_chunks", "summarize")
     g.add_edge("summarize", "think")
     g.add_conditional_edges("think", _route_after_think, {"retrieve_docs": "retrieve_docs", "answer": "answer"})
@@ -512,7 +621,7 @@ def build_keyword_agentic_graph(
 async def run_keyword_agentic_rag(
     tools,
     messages: list,
-    max_iterations: int = 3,
+    max_iterations: int = 12,
     enable_snippets: bool = True,
     gen_conf: dict | None = None,
 ):
@@ -537,7 +646,7 @@ async def run_keyword_agentic_rag(
     async def _drive():
         try:
             holder["state"] = await graph.ainvoke(
-                {"question": question, "max_iterations": max_iterations, "iteration": 0, "chunks": [], "evidences": []},
+                {"question": question, "max_iterations": max_iterations, "iteration": 0, "chunks": [], "evidences": [], "resolved": {}, "pending": []},
                 {"recursion_limit": max(25, max_iterations * 8 + 10)},
             )
         except Exception:

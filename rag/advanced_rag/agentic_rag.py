@@ -44,7 +44,7 @@ from common import settings
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string
 from rag.advanced_rag.agentic_rag_graph import _split_think_stream
-from rag.advanced_rag.keyword_agentic_graph import run_keyword_agentic_rag
+from rag.advanced_rag.keyword_agentic_graph_v2 import run_keyword_agentic_rag_v2
 from rag.app.tag import label_question
 from rag.llm.tool_decorator import tool
 from rag.prompts.generator import (
@@ -603,7 +603,7 @@ class RAGTools:
             }
         messages = [{"role": "user", "content": question}] if question else []
         final = ""
-        async for kind, delta in _split_think_stream(run_keyword_agentic_rag(self, messages)):
+        async for kind, delta in _split_think_stream(run_keyword_agentic_rag_v2(self, messages)):
             if kind == "answer":
                 final += delta
             if self.answer_sink is not None:

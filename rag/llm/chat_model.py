@@ -2101,6 +2101,15 @@ class LiteLLMBase(ABC):
 
                     logging.info(f"Response tool_calls={message.tool_calls}")
                     results = await asyncio.gather(*[_exec_tool(tc) for tc in message.tool_calls])
+                    _terminal = getattr(self, "terminal_tools", None)
+                    if _terminal:
+                        for tc, name, args, result, err in results:
+                            if name in _terminal and not err:
+                                logging.info(f"[Tool loop] The {name} tool produced the final answer — done.")
+                                out = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                                if out:
+                                    ans += out
+                                return self._sanitize_answer(ans), tk_count
                     history = self._append_history_batch(
                         history,
                         results,
