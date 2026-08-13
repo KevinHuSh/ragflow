@@ -185,6 +185,7 @@ async def doc_summary_for_skill(
         ctx.kb_id,
         doc_id,
         batch_size=SKILL_CHUNK_BATCH,
+        overlap=0,
     ):
         for chunk in batch:
             text = chunk.get("content_with_weight") or ""

@@ -540,7 +540,26 @@ class Base(ABC):
                             return tc, name, {}, None, e
 
                     logging.info(f"Response tool_calls={response.choices[0].message.tool_calls}")
-                    results = await asyncio.gather(*[_exec_tool(tc) for tc in response.choices[0].message.tool_calls])
+                    tcs = list(response.choices[0].message.tool_calls)
+                    _terminal = getattr(self, "terminal_tools", None)
+                    if _terminal:
+                        for tc in tcs:
+                            if tc.function.name in _terminal:
+                                logging.info(f"[Tool loop] Running terminal tool {tc.function.name} first; skipping sibling tool calls.")
+                                results = [await _exec_tool(tc)]
+                                break
+                        else:
+                            results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    else:
+                        results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    if _terminal:
+                        for tc, name, args, result, err in results:
+                            if name in _terminal and not err:
+                                logging.info(f"[Tool loop] The {name} tool produced the final answer - done.")
+                                out = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                                if out:
+                                    ans += out
+                                return self._sanitize_answer(ans), tk_count
                     history = self._append_history_batch(history, results)
                     for tc, name, args, result, err in results:
                         ans += self._verbose_tool_use(name, args, err if err else result)
@@ -687,11 +706,21 @@ class Base(ABC):
                         except Exception:
                             args = {}
                         yield f"<think>Running the {tc.function.name} tool...</think>"
-                    results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    _terminal = getattr(self, "terminal_tools", None)
+                    if _terminal:
+                        results = None
+                        for tc in tcs:
+                            if tc.function.name in _terminal:
+                                logging.info(f"[Tool loop] Running terminal tool {tc.function.name} first; skipping sibling tool calls.")
+                                results = [await _exec_tool(tc)]
+                                break
+                        if results is None:
+                            results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
+                    else:
+                        results = await asyncio.gather(*[_exec_tool(tc) for tc in tcs])
 
                     # Terminal-tool short-circuit: stream a terminal tool's
                     # result (already the final answer) and stop the loop.
-                    _terminal = getattr(self, "terminal_tools", None)
                     if _terminal:
                         for tc, name, args, result, err in results:
                             if name in _terminal and not err:

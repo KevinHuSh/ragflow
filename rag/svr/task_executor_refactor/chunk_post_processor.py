@@ -1099,6 +1099,7 @@ async def run_document_structure_compile(handler, embedding_model: LLMBundle) ->
             ctx.kb_id,
             ctx.doc_id,
             batch_size=DOC_STRUCTURE_COMPILE_BATCH_CHUNKS,
+            overlap=0,
         ):
             yield batch
 

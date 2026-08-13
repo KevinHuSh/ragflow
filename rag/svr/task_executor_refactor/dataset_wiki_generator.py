@@ -1319,6 +1319,7 @@ async def run_wiki(
                 ctx.kb_id,
                 doc_id,
                 batch_size=WIKI_MAP_BATCH_CHUNKS,
+                overlap=0,
             ):
                 stats["saw_any"] = True
                 stats["batch_count"] += 1
@@ -1657,6 +1658,7 @@ async def run_wiki_incremental(
                 ctx.kb_id,
                 doc_id,
                 batch_size=WIKI_MAP_BATCH_CHUNKS,
+                overlap=0,
             ):
                 await map_queue.put((i, doc, template_id, doc_configs.get(doc_id, {}), batch))
         except Exception:

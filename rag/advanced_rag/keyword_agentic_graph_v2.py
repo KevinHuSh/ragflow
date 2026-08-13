@@ -48,7 +48,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-import math
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -76,8 +75,7 @@ _MAX_ANALYZE_SUBQUESTIONS = 2  # independent sub-questions emitted by the initia
 _DOC_TOP_N = 6  # chunk hits fetched per sub-q to pick the top-1 doc
 _CHUNKS_PER_DOC = 6  # chunks pulled from the chosen doc
 _SUMMARY_CHUNKS = 3  # chunks per summariser batch (shown to, and citable by, the LLM)
-_DOC_ORDERED_LIMIT = 10000  # max chunks fetched when ordering a doc
-_MAX_DOC_BATCHES = 8  # max overlapping batches scanned per sub-q when the retrieved chunks miss
+_MAX_DOC_BATCHES = 12  # max overlapping batches scanned per sub-q when the retrieved chunks miss
 
 
 # ── Prompts (each a single, self-contained LLM call) ──
@@ -193,45 +191,6 @@ def build_keyword_agentic_graph_v2(
         )
         return _normalize(kbinfos, tools.tenant_ids)
 
-    async def _fetch_doc_chunks_ordered(doc_id: str) -> list[dict]:
-        """All chunks of ``doc_id`` in document order (by ``chunk_order_int``)."""
-        from common import settings
-        from common.doc_store.doc_store_base import OrderByExpr
-        from common.misc_utils import thread_pool_exec
-        from rag.nlp import search as _rag_search
-
-        index_names = [_rag_search.index_name(t) for t in tools.tenant_ids]
-        fields = ["id", "content_with_weight", "docnm_kwd", "doc_id", "chunk_order_int"]
-        order = OrderByExpr()
-        try:
-            order.asc("chunk_order_int")
-        except Exception:
-            order = OrderByExpr()
-        try:
-            res = await thread_pool_exec(settings.docStoreConn.search, fields, [], {"doc_id": [doc_id]}, [], order, 0, _DOC_ORDERED_LIMIT, index_names, tools.kb_ids)
-            rows = settings.docStoreConn.get_fields(res, fields) or {}
-        except Exception:
-            _LOG.exception("[Adjacent] ordered doc fetch failed for %s", doc_id)
-            return []
-        out = []
-        for cid, row in rows.items():
-            try:
-                order_int = int(row.get("chunk_order_int") or 0)
-            except (TypeError, ValueError):
-                order_int = 0
-            out.append(
-                {
-                    "id": cid,
-                    "chunk_id": cid,
-                    "content_with_weight": row.get("content_with_weight") or "",
-                    "docnm_kwd": row.get("docnm_kwd") or "",
-                    "doc_id": row.get("doc_id") or doc_id,
-                    "_order": order_int,
-                }
-            )
-        out.sort(key=lambda c: c["_order"])
-        return out
-
     async def _summarize_chunks(question: str, chunks: list[dict]) -> tuple[str, list[dict]]:
         """LLM summary + the chunk objects it marked relevant (by 1-based number)."""
         shown = chunks[:_SUMMARY_CHUNKS]
@@ -251,34 +210,52 @@ def build_keyword_agentic_graph_v2(
                 relevant.append(shown[i])
         return sub_answer, relevant
 
-    async def _answer_by_batches(sq: dict) -> tuple[str, list[dict]]:
+    async def _answer_by_batches(sq: dict, batch_size: int = 4, overlap: int = 1) -> tuple[str, list[dict]]:
         """Scan the sub-question's document in overlapping batches until answered.
 
-        The doc's chunks are read in document order and summarized ``_SUMMARY_CHUNKS``
-        at a time; consecutive batches overlap by ONE chunk (the last chunk of a
-        batch starts the next), so an answer straddling a boundary is never split.
-        Stops as soon as a batch yields a relevant chunk, or after ``_MAX_DOC_BATCHES``.
+        The document is read in document order and summarized in batches. Consecutive
+        batches overlap by ``overlap`` chunks, so an answer straddling a boundary is
+        not split. The default batch size is 3 and the default overlap is 1.
         Returns ``(summary, relevant chunks)``.
         """
-        ordered = await _fetch_doc_chunks_ordered(sq["doc_id"])
-        n = len(ordered)
-        _LOG.info("[Read file]: %s(%d) -> %s", sq["doc_nm"], n, sq["question"])
-        if not n:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if overlap < 0 or overlap >= batch_size:
+            raise ValueError("overlap must be non-negative and smaller than batch_size")
+        resolved = await tools._resolve_doc_tenant(sq["doc_id"])
+        if not resolved:
             return "", []
-        step = max(1, _SUMMARY_CHUNKS - 1)  # 1-chunk overlap between batches
-        start = 0
-        for _scan in range(_MAX_DOC_BATCHES):
-            batch = ordered[start : start + _SUMMARY_CHUNKS]
-            if not batch:
+        kb_id, tenant_id = resolved
+        from rag.svr.task_executor_refactor.task_handler import TaskHandler
+
+        summaries: list[str] = []
+        relevant_chunks: list[dict] = []
+        seen_relevant: set[str] = set()
+        batch_count = 0
+        async for loaded_batch in TaskHandler._load_chunks_for_doc(
+            tenant_id,
+            kb_id,
+            sq["doc_id"],
+            batch_size=batch_size,
+            overlap=overlap,
+        ):
+            if batch_count >= _MAX_DOC_BATCHES:
                 break
-            summary, relevant = await _summarize_chunks(sq["question"], batch)
+            batch_count += 1
+            summary, relevant = await _summarize_chunks(sq["question"], loaded_batch)
             if relevant:
-                _LOG.info("[Summarize] sub-q %s answered from doc batch [%d:%d].", sq["id"], start, start + len(batch))
-                return summary, relevant
-            if start + _SUMMARY_CHUNKS >= n:  # this batch already reached the doc end
+                if summary:
+                    summaries.append(summary)
+                for chunk in relevant:
+                    chunk_id = _chunk_id(chunk)
+                    if chunk_id not in seen_relevant:
+                        seen_relevant.add(chunk_id)
+                        relevant_chunks.append(chunk)
+                _LOG.info("[Summarize] sub-q %s answered from doc batch %d (%d chunks, overlap=%d).", sq["question"], batch_count, len(loaded_batch), overlap)
                 break
-            start += step
-        _LOG.info("[Read file] failure: %s(%d) -> %s", sq["doc_nm"], n, sq["question"])
+        if relevant_chunks:
+            return "\n\n".join(summaries), relevant_chunks
+        _LOG.info("[Read file] failure: %s(%d batch(es)) -> %s", sq["doc_nm"], batch_count, sq["question"])
         return "", []
 
     # ── Node 1: analyze — decompose Q into independent sub-questions (LLM) ──
@@ -334,9 +311,11 @@ def build_keyword_agentic_graph_v2(
                 did = ck.get("doc_id")
                 nm = ck.get("docnm_kwd", "")
                 if did:
-                    counts[did + "\t" + nm] += math.pow(ck.get("similarity", sc) * 100.0, 2.0)
+                    k = did + "\t" + nm
+                    if k in counts:
+                        continue
+                    counts[k] = ck.get("similarity", sc)
                 sc /= i + 1.0
-            print(sq, max(counts.items(), key=lambda x: x[1]), "JJJJJJJJJJJJJJJJJJJJJ", flush=True)
             return max(counts.items(), key=lambda x: x[1])[0] if counts else ""
 
         docs = await asyncio.gather(*[_one(sq) for sq in subqs])

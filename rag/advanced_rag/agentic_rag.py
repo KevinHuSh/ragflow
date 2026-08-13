@@ -30,6 +30,7 @@ model (no tool schema is bound onto it) and its ``async_chat*`` calls take
 the fast non-tool-calling path.
 """
 
+import asyncio
 import logging
 import re
 from collections.abc import Callable
@@ -44,7 +45,7 @@ from common import settings
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string
 from rag.advanced_rag.agentic_rag_graph import _split_think_stream
-from rag.advanced_rag.keyword_agentic_graph_v2 import run_keyword_agentic_rag_v2
+from rag.advanced_rag.keyword_agentic_graph_v4 import run_keyword_agentic_rag_v4
 from rag.app.tag import label_question
 from rag.llm.tool_decorator import tool
 from rag.prompts.generator import (
@@ -143,6 +144,11 @@ class RAGTools:
         # times. The first call caches its answer; later calls this turn are
         # short-circuited to it instead of re-running the whole pipeline.
         self._rag_answer: str | None = None
+        # The model can emit SEVERAL `rag` tool_calls in one assistant message, and
+        # the tool loop runs them with asyncio.gather — i.e. concurrently. Without
+        # this lock every one of them passes the `_rag_answer is None` check before
+        # the first has finished, so the whole pipeline runs N times in parallel.
+        self._rag_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     # Capability flags / cheap introspection
@@ -579,9 +585,15 @@ class RAGTools:
         :returns: the composed answer with inline citation markers.
         """
 
-        # Hard guard: run the pipeline at most once per user turn. If the outer
-        # LLM tries to decompose the question and call `rag` again, hand back the
-        # first answer with a directive to stop instead of re-running.
+        # Hard guard: run the pipeline at most once per user turn. The lock makes
+        # the check-then-run atomic, so parallel tool_calls in the SAME round are
+        # serialized and only the first one actually runs the pipeline; the rest
+        # fall through to the cached answer below.
+        async with self._rag_lock:
+            return await self._rag_once(question)
+
+    async def _rag_once(self, question: str) -> str:
+        """Body of :meth:`rag`, executed under ``self._rag_lock``."""
         if self._rag_answer is not None:
             logging.info("[rag] Already answered this turn; short-circuiting a repeat call.")
             return "NOTE: `rag` already ran for this user question and searches/decomposes internally. Do NOT call `rag` again for this question — answer from the result below.\n\n" + self._rag_answer
@@ -603,7 +615,7 @@ class RAGTools:
             }
         messages = [{"role": "user", "content": question}] if question else []
         final = ""
-        async for kind, delta in _split_think_stream(run_keyword_agentic_rag_v2(self, messages)):
+        async for kind, delta in _split_think_stream(run_keyword_agentic_rag_v4(self, messages)):
             if kind == "answer":
                 final += delta
             if self.answer_sink is not None:

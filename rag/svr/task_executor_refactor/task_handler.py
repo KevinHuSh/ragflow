@@ -740,6 +740,7 @@ class TaskHandler:
         kb_id: str,
         doc_id: str,
         batch_size: int = 500,
+        overlap: int = 1,
     ) -> AsyncIterator[List[Dict]]:
         """Stream a document's chunks from the doc store one batch at a time.
 
@@ -749,9 +750,14 @@ class TaskHandler:
         not need to re-sort. Rows with a ``compile_kwd`` marker (artifact
         pages, structure entities, etc.) are filtered out defensively.
 
-        Memory is bounded by ``batch_size``: at most one page is materialised
-        at a time, so long documents do not balloon the worker's heap.
+        Consecutive batches share the last ``overlap`` chunks. Memory remains
+        bounded by ``batch_size`` plus the overlap window.
         """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if overlap < 0 or overlap >= batch_size:
+            raise ValueError("overlap must be non-negative and smaller than batch_size")
+
         from common.doc_store.doc_store_base import OrderByExpr
 
         index_nm = search.index_name(tenant_id)
@@ -761,6 +767,7 @@ class TaskHandler:
         select_fields = [
             "id",
             "doc_id",
+            "docnm_kwd",
             "content_with_weight",
             "page_num_int",
             "top_int",
@@ -771,6 +778,7 @@ class TaskHandler:
         order_by.asc("top_int")
 
         offset = 0
+        step = batch_size - overlap
         while True:
             try:
                 res = await thread_pool_exec(
@@ -817,7 +825,7 @@ class TaskHandler:
                 yield batch
             if len(field_map) < batch_size:
                 return
-            offset += batch_size
+            offset += step
 
     @classmethod
     def _build_toc(cls, ctx: TaskContext, docs: List[Dict], progress_cb: Callable) -> Optional[Dict]:
