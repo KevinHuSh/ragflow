@@ -227,17 +227,34 @@ Output ONLY JSON, no prose, no code fences:
 _ASSESS_SYSTEM = """You are given ONE chunk of text and a sub-question.
 Judge ONLY how much of the sub-question THIS SINGLE chunk can answer. Do not write the answer.
 - "full"    — this chunk ALONE completely answers the sub-question: it states the specific value
-              asked for (the date, number, name, ...).
+              asked for (the date, number, name, ...), OR that value follows from figures stated in
+              THIS chunk by a trivial, certain derivation (see below).
 - "partial" — this chunk contributes a genuinely relevant fact, but does not state the specific
-              value asked for.
+              value asked for and does not force it arithmetically.
 - "none"    — this chunk does not help answer the sub-question.
-Do not infer, guess or use outside knowledge. Judge only this chunk, not what other chunks might say.
+
+A TRIVIAL, CERTAIN derivation is arithmetic that is forced by the stated figures — never a guess:
+- the complement of a share of one whole: the question asks what share A is, the chunk states B's
+  share of the same whole, so A = 100% - B. e.g. asked "what percentage did Enix make up" and the
+  chunk says "80% of staff were former Square employees" -> Enix is 20% -> "full".
+- a unit conversion, or the sum/difference of figures stated in the chunk.
+Anything needing an outside fact, an estimate, or an assumption is NOT trivial — judge that "partial".
+Do not guess or use outside knowledge. Judge only this chunk, not what other chunks might say.
 Output ONLY JSON, no prose, no code fences:
 {"status": "full|partial|none"}"""
 
 _SUMMARIZE_SYSTEM = """You are given a sub-question and NUMBERED chunks that DO answer it.
 Answer the sub-question from those chunks only — concise and factual, no speculation, no outside
 knowledge. Also return "relevant": the chunk NUMBERS that support your answer.
+
+Answer the question that was ASKED. When the chunks state a related figure rather than the one asked
+for, you MAY complete a trivial, certain derivation and give the asked-for value, showing the figure
+it came from:
+- complement of a share of one whole: asked "what percentage did Enix make up", chunk says "80% of
+  staff were former Square employees" -> answer "20% (the chunks state 80% were former Square staff)".
+- a unit conversion, or the sum/difference of figures stated in the chunks.
+Do NOT estimate, assume, or bring in any figure the chunks do not state. If the asked-for value is
+not stated and not arithmetically forced, say plainly what the chunks do state instead.
 Output ONLY JSON, no prose, no code fences:
 {"summary": "<concise factual answer>", "relevant": [<chunk number>, ...]}"""
 
@@ -246,15 +263,32 @@ Decide ONLY whether those facts are ENOUGH to answer the ORIGINAL question direc
 Do NOT propose follow-up research.
 - "sufficient" is true only when EVERY part of the ORIGINAL question can be answered from the facts.
 - Do not assume, infer or fill in a value that no fact states.
+- If the core entity/value is already known but a qualifier like exact date, source date,
+  or formatting detail is missing, prefer "sufficient": false and let the caller answer partially
+  from the known value instead of chasing a finer-grained fact.
 Output ONLY JSON, no prose, no code fences:
 {"sufficient": true/false}"""
 
-_MISSING_SYSTEM = """You are given the ORIGINAL question and the facts discovered so far.
+_MISSING_SYSTEM = """You are given the ORIGINAL question, the facts discovered so far, and every
+sub-question ALREADY ASKED (each marked with whether it found evidence).
 The evidence was already judged insufficient.
-Using the SAME facts and question, state precisely what is still missing for a complete answer.
-Do NOT answer the question and do NOT invent facts.
+
+State precisely what is still missing for a complete answer. Do NOT answer the question and do NOT
+invent facts.
+- USE THE ORIGINAL QUESTION'S OWN WORDING for the unknown. Do NOT paraphrase it into a different
+  concept: "make up" is not "own", "worth" is not "earned", "led" is not "founded". Re-wording the
+  unknown sends every later round chasing a different fact than the one that was asked for.
+- If that wording is AMBIGUOUS (e.g. "what percentage did X make up" could mean share of staff,
+  of ownership, of revenue, or of output), do NOT pick one reading. List the plausible readings so
+  the next step can try them, and keep the question's original phrase in your answer.
+- If the facts already contain a usable core value, say the missing part is only the qualifier.
+- Take the already-asked list into account. If the missing item was already searched for and found
+  nothing, say so explicitly ("X is missing; it was already searched for via <sub-question> and no
+  evidence was found"), so the next planning step tries a DIFFERENT angle instead of repeating it.
+- Set "exhausted" to true when every plausible angle for the missing item has already been asked and
+  failed — i.e. more rounds are unlikely to help.
 Output ONLY JSON, no prose, no code fences:
-{"missing": "<what is still missing, or empty>"}"""
+{"missing": "<what is still missing, or empty>", "exhausted": true/false}"""
 
 _NEXT_SUBQ_SYSTEM = """The facts gathered so far do NOT yet answer the ORIGINAL question. You are given
 what is still missing and EVERY sub-question already asked. Plan the NEXT round.
@@ -264,6 +298,13 @@ what is still missing and EVERY sub-question already asked. Plan the NEXT round.
   progress across rounds. Example — if a fact says the city is "Baltimore", ask "When was Baltimore
   founded?", NOT "When was that city founded?".
 - Keep each sub-question SIMPLE, ATOMIC and INDEPENDENT: one fact per question, searchable on its own.
+- KEEP THE ORIGINAL QUESTION'S WORDING for the thing being asked. Do NOT swap in a near-synonym that
+  means something different ("make up" -> "own", "worth" -> "earned"): sources tend to state the fact
+  using the asker's own phrasing, so re-wording it loses the very text that holds the answer.
+- A sub-question marked "[PARTIAL ...]" was NOT settled — the sources were on-topic but never stated
+  the value. Do not move on to a different topic as if it were answered: either ask for that same
+  value in the ORIGINAL question's wording, or try a DIFFERENT READING of the ambiguous term. Do not
+  simply drill into a finer-grained version of the same failed reading.
 - Never use an unresolved reference. If a needed value is still unknown, ask for THAT value instead —
   do not chain two unknowns in one sub-question.
 - NEVER repeat or rephrase anything under "Sub-questions ALREADY asked" — those rounds are spent.
@@ -272,6 +313,11 @@ what is still missing and EVERY sub-question already asked. Plan the NEXT round.
 - If no genuinely NEW and useful sub-question exists — every angle is spent, or the corpus plainly
   cannot supply what is missing — return an EMPTY "next_subquestions" list. An empty list is the
   CORRECT answer in that case; never pad it with a variation of something already asked.
+- If the facts already contain the core value needed for a usable partial answer, and the only
+  remaining gap is a qualifier like an exact date, source date, or formatting detail, STOP.
+  Return an EMPTY "next_subquestions" list instead of asking for a finer-grained follow-up.
+- Do not keep narrowing a resolved birthplace from prefecture/state/country to a city/town unless
+  the question itself explicitly asked for that smaller unit.
 - Generate AT MOST TWO. (Keywords are added by a separate step, so output the questions only.)
 Output ONLY JSON, no prose, no code fences:
 {"next_subquestions": [{"question": "<sub-question>"}, ...]}"""
@@ -293,6 +339,7 @@ class KwV4State(TypedDict, total=False):
     max_iterations: int
     sufficient: bool
     partial: bool
+    exhausted: bool  # every angle for the remaining gap has already been tried
     missing: str
     final_answer: str
 
@@ -375,7 +422,7 @@ def build_keyword_agentic_graph_v4(
         status = str(parsed.get("status") or "").strip().lower()
         return status if status in ("full", "partial", "none") else "none"
 
-    async def _assess_chunks(question: str, chunks: list[dict]) -> tuple[bool, list[dict]]:
+    async def _assess_chunks(question: str, chunks: list[dict]) -> tuple[str, list[dict]]:
         """Walk the chunks ONE BY ONE, keeping the useful ones.
 
         Stops at the first chunk that FULLY answers the sub-question — later chunks
@@ -383,12 +430,16 @@ def build_keyword_agentic_graph_v4(
         Chunks judged ``partial`` are collected and the walk continues, so several
         partials can together support an answer.
 
-        Returns ``(answerable, useful chunks)``; only the useful chunks are handed
-        to the summariser.
+        Returns ``(status, useful chunks)`` where status is ``"full"`` when some
+        chunk answered outright, ``"partial"`` when only partial chunks were found,
+        and ``"none"`` otherwise. The status is carried all the way to the planner:
+        an answer built only from partials is NOT done, and must be revisited rather
+        than treated as settled. Only the useful chunks are handed to the summariser.
         """
         shown = chunks
         useful: list[dict] = []
         picked: list[str] = []
+        status_out = "none"
         for i, ck in enumerate(shown):
             status = await _assess_one(question, ck)
             if status == "none":
@@ -396,10 +447,12 @@ def build_keyword_agentic_graph_v4(
             useful.append(ck)
             picked.append(f"{i + 1}:{status}")
             if status == "full":
+                status_out = "full"
                 break  # this chunk alone answers it — stop judging the rest
+            status_out = "partial"
         if picked:
-            _LOG.info("[Assess] useful chunk(s) %s of %d for: %s", ", ".join(picked), len(shown), _snip(question))
-        return bool(useful), useful
+            _LOG.info("[Assess] %s — useful chunk(s) %s of %d for: %s", status_out.upper(), ", ".join(picked), len(shown), _snip(question))
+        return status_out, useful
 
     async def _summarize(question: str, chunks: list[dict]) -> tuple[str, list[dict]]:
         """Summarize a pair from its USEFUL chunks only (as picked by ``_assess_chunks``).
@@ -454,8 +507,8 @@ def build_keyword_agentic_graph_v4(
                 if batch_count >= _MAX_DOC_BATCHES:
                     break
                 batch_count += 1
-                answerable, useful = await _assess_chunks(sq["question"], batch)
-                if answerable:
+                status, useful = await _assess_chunks(sq["question"], batch)
+                if status != "none":
                     _LOG.info("[Deep scan] '%s' batch %d answers with %d chunk(s): %s", doc_nm, batch_count, len(useful), _snip(sq["question"]))
                     return useful
         return []
@@ -468,7 +521,7 @@ def build_keyword_agentic_graph_v4(
         subqs = _mk_subqs(parsed.get("subquestions"), 0, limit=_MAX_ANALYZE_SUBQUESTIONS) or _mk_subqs([{"question": q}], 0, limit=_MAX_ANALYZE_SUBQUESTIONS)
         for sq in subqs:
             _LOG.info("[Sub-Q]: %s", sq["question"])
-        return {"subquestions": subqs, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False}
+        return {"subquestions": subqs, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False, "exhausted": False}
 
     # ── Node 2: keywords — search terms + synonyms + number/date variants (LLM) ──
     async def keywords_node(state: KwV4State) -> dict:
@@ -524,25 +577,26 @@ def build_keyword_agentic_graph_v4(
     async def assess_node(state: KwV4State) -> dict:
         subqs = state.get("subquestions") or []
 
-        async def _one(sq: dict) -> bool:
+        async def _one(sq: dict) -> str:
             if sq["chunks"]:
-                answerable, useful = await _assess_chunks(sq["question"], sq["chunks"])
+                status, useful = await _assess_chunks(sq["question"], sq["chunks"])
                 sq["chunks"] = useful
-                if answerable:
-                    return True
+                if status != "none":
+                    return status
             # Deep scan still reads the ORIGINAL chunks above to pick which
             # documents to open, so only overwrite them once it succeeds.
             if enable_deep_scan:
                 useful = await _deep_scan(sq)
                 if useful:
                     sq["chunks"] = useful
-                    return True
-            return False
+                    return "partial"
+            return "none"
 
-        flags = await asyncio.gather(*[_one(sq) for sq in subqs])
-        for sq, ok in zip(subqs, flags):
-            sq["answerable"] = bool(ok)
-        _LOG.info("[Assess] answerable %d/%d sub-q(s).", sum(1 for f in flags if f), len(subqs))
+        statuses = await asyncio.gather(*[_one(sq) for sq in subqs])
+        for sq, status in zip(subqs, statuses):
+            sq["status"] = status
+            sq["answerable"] = status != "none"
+        _LOG.info("[Assess] %d full, %d partial, %d unanswerable of %d sub-q(s).", statuses.count("full"), statuses.count("partial"), statuses.count("none"), len(subqs))
         return {"subquestions": subqs}
 
     # ── Node 7: summarize — evidence from the answerable pairs only (LLM) ──
@@ -574,7 +628,17 @@ def build_keyword_agentic_graph_v4(
                 if cid not in seen:
                     seen.add(cid)
                     pool.append(c)
-            evidences.append({"iteration": it, "subq": sq["question"], "summary": summary, "chunk_ids": [_chunk_id(c) for c in relevant]})
+            evidences.append(
+                {
+                    "iteration": it,
+                    "subq": sq["question"],
+                    # "full" == answered outright; "partial" == built only from partial
+                    # chunks, so the planner must treat it as an OPEN gap, not settled.
+                    "status": sq.get("status", "full"),
+                    "summary": summary,
+                    "chunk_ids": [_chunk_id(c) for c in relevant],
+                }
+            )
         _LOG.info("[Summarize] +%d evidence (%d total), pool=%d chunk(s) at round %d.", len([r for r in results if r[0]]), len(evidences), len(pool), it)
         return {"subquestions": subqs, "evidences": evidences, "pool": pool, "asked": asked}
 
@@ -583,29 +647,45 @@ def build_keyword_agentic_graph_v4(
         evidences = state.get("evidences") or []
         ev_text = "\n\n".join(f"(round {e.get('iteration', 0)}) {e['subq']}\n-> {e['summary']}" for e in evidences) or "(nothing discovered yet)"
         prompt = f"Facts discovered so far:\n{ev_text}\n\nOriginal question:\n{state.get('question') or ''}\n\nOutput JSON:"
-        verdict = await _llm_json(
-            _SUFFICIENCY_SYSTEM,
-            prompt,
-        )
+        # Step 1: sufficiency only — the prompt returns just {"sufficient": bool}.
+        verdict = await _llm_json(_SUFFICIENCY_SYSTEM, prompt)
         sufficient = bool(verdict.get("sufficient"))
+
+        # Step 2: only when insufficient, ask what is missing over the SAME prompt —
+        # plus the already-asked list, so the gap is described in terms of what has
+        # actually been tried instead of being restated identically every round.
         missing = ""
+        exhausted = False
         if not sufficient:
+            asked = state.get("asked") or []
+            status_of = {_norm(e["subq"]): e.get("status", "full") for e in evidences}
+            _label = {"full": "", "partial": "   [PARTIAL — the specific value was never stated]"}
+            tried = "\n".join(f"- {a}" + _label.get(status_of.get(_norm(a), ""), "   [searched, no evidence found]") for a in asked)
+            missing_prompt = prompt
+            if tried:
+                missing_prompt += f"\n\nSub-questions ALREADY asked:\n{tried}"
             missing_verdict = await _llm_json(
                 _MISSING_SYSTEM,
-                prompt + "\n\nThe evidence is not sufficient. Tell me what is missing.",
+                missing_prompt + f"\n\nOriginal question:\n{state.get('question') or ''}\n\nIn order to answer the original question. Tell me what is missing.",
             )
             missing = str(missing_verdict.get("missing") or "").strip()
+            # Only trust "exhausted" once something has actually been tried — on the
+            # first round nothing has been searched yet, so it cannot be exhausted.
+            exhausted = bool(missing_verdict.get("exhausted")) and bool(asked)
+            if exhausted:
+                _LOG.info("[Sufficiency] every angle for the remaining gap has already been tried — answering partially instead of spending another round.")
         it = state.get("iteration", 0) + 1
-        _LOG.info("[Sufficiency] round %d → sufficient=%s. Missing: %s", it, sufficient, _snip(missing))
-        return {"sufficient": sufficient, "missing": missing, "iteration": it}
+        _LOG.info("[Sufficiency] round %d → sufficient=%s, exhausted=%s. Missing: %s", it, sufficient, exhausted, _snip(missing))
+        return {"sufficient": sufficient, "missing": missing, "exhausted": exhausted, "iteration": it}
 
     # ── Node 10: next_subq — plan the next round from the asked records (LLM) ──
     async def next_subq_node(state: KwV4State) -> dict:
         evidences = state.get("evidences") or []
         asked = state.get("asked") or []
         it = state.get("iteration", 0)
-        ev_text = "\n\n".join(f"(round {e.get('iteration', 0)}) {e['subq']}\n-> {e['summary']}" for e in evidences) or "(nothing discovered yet)"
-        answered_keys = {_norm(e["subq"]) for e in evidences}
+        ev_text = "\n\n".join(f"(round {e.get('iteration', 0)}, {e.get('status', 'full').upper()}) {e['subq']}\n-> {e['summary']}" for e in evidences) or "(nothing discovered yet)"
+        status_of = {_norm(e["subq"]): e.get("status", "full") for e in evidences}
+        _label = {"full": "", "partial": "   [PARTIAL — answered only from partial chunks; the specific value was never stated]"}
 
         parts = [
             f"Original question:\n{state.get('question') or ''}",
@@ -613,7 +693,7 @@ def build_keyword_agentic_graph_v4(
             f"Still missing:\n{state.get('missing') or '(not stated)'}",
         ]
         if asked:
-            tried = "\n".join(f"- {a}" + ("" if _norm(a) in answered_keys else "   [no evidence found]") for a in asked)
+            tried = "\n".join(f"- {a}" + _label.get(status_of.get(_norm(a), ""), "   [no evidence found]") for a in asked)
             parts.append(f"Sub-questions ALREADY asked (never repeat or rephrase these):\n{tried}")
         parts.append("Output JSON:")
 
@@ -676,7 +756,9 @@ def build_keyword_agentic_graph_v4(
     def _route_after_sufficiency(state: KwV4State) -> str:
         if state.get("sufficient"):
             return "answer"
-        if state.get("iteration", 0) >= max_iterations:
+        # Exhausted == every angle for the gap has already been tried, so planning
+        # another round would only re-derive a dead end. Answer with what we have.
+        if state.get("exhausted") or state.get("iteration", 0) >= max_iterations:
             return "answer_partial"
         return "next_subq"
 
@@ -714,7 +796,7 @@ def build_keyword_agentic_graph_v4(
 async def run_keyword_agentic_rag_v4(
     tools,
     messages: list,
-    max_iterations: int = 5,
+    max_iterations: int = 3,
     enable_snippets: bool = False,
     enable_deep_scan: bool = False,
     gen_conf: dict | None = None,
@@ -741,7 +823,7 @@ async def run_keyword_agentic_rag_v4(
     async def _drive():
         try:
             holder["state"] = await graph.ainvoke(
-                {"question": question, "max_iterations": max_iterations, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False},
+                {"question": question, "max_iterations": max_iterations, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False, "exhausted": False},
                 {"recursion_limit": max(25, max_iterations * 8 + 10)},
             )
         except Exception:

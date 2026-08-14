@@ -475,6 +475,23 @@ class Base(ABC):
         self.is_tools = True
         self.toolcall_session = toolcall_session
         self.tools = tools
+        if tools:
+            terminal_tools = set(getattr(self, "terminal_tools", None) or ())
+
+            def _tool_name(tool) -> str:
+                if isinstance(tool, dict):
+                    fn = tool.get("function") or {}
+                    return str(fn.get("name") or tool.get("name") or "")
+                schema = getattr(tool, "openai_schema", None)
+                if isinstance(schema, dict):
+                    fn = schema.get("function") or {}
+                    return str(fn.get("name") or schema.get("name") or getattr(tool, "__name__", "") or "")
+                return str(getattr(tool, "__name__", "") or "")
+
+            if any(_tool_name(tool) == "rag" for tool in tools):
+                terminal_tools.add("rag")
+            if terminal_tools:
+                self.terminal_tools = terminal_tools
 
     async def async_chat_with_tools(self, system: str, history: list, gen_conf: dict | None = None):
         gen_conf = dict(gen_conf or {})
@@ -2086,7 +2103,7 @@ class LiteLLMBase(ABC):
             history = deepcopy(hist)
             try:
                 for _ in range(self.max_rounds + 1):
-                    logging.info(f"HAS TOOL:{len(self.tools)}\n{history=}")
+                    # logging.info(f"HAS TOOL:{len(self.tools)}\n{history=}")
 
                     completion_args = self._construct_completion_args(history=history, stream=False, tools=True, **gen_conf)
                     response = await litellm.acompletion(
