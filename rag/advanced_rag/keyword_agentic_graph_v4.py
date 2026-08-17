@@ -46,6 +46,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from common.token_utils import num_tokens_from_string, truncate
 from rag.prompts.generator import citation_prompt, form_message, message_fit_in
 from rag.advanced_rag.harness.prompts.report_prompt import FINAL_ANSWER_SYSTEM
 from rag.advanced_rag.harness.tools.search import _narrow_by_keywords, _normalize
@@ -224,8 +225,8 @@ Output ONLY JSON, no prose, no code fences:
 {"keywords": [{"id": "<sub-question id>", "keywords": ["term or synonym", ...]}, ...]}"""
 )
 
-_ASSESS_SYSTEM = """You are given ONE chunk of text and a sub-question.
-Judge ONLY how much of the sub-question THIS SINGLE chunk can answer. Do not write the answer.
+_ASSESS_SYSTEM = """You are given a sub-question and a consecutive, numbered batch of chunks.
+Judge EACH chunk independently. Do not write the answer.
 - "full"    — this chunk ALONE completely answers the sub-question: it states the specific value
               asked for (the date, number, name, ...), OR that value follows from figures stated in
               THIS chunk by a trivial, certain derivation (see below).
@@ -239,9 +240,10 @@ A TRIVIAL, CERTAIN derivation is arithmetic that is forced by the stated figures
   chunk says "80% of staff were former Square employees" -> Enix is 20% -> "full".
 - a unit conversion, or the sum/difference of figures stated in the chunk.
 Anything needing an outside fact, an estimate, or an assumption is NOT trivial — judge that "partial".
-Do not guess or use outside knowledge. Judge only this chunk, not what other chunks might say.
+Do not guess or use outside knowledge. Judge only the corresponding chunk, not what other chunks might say.
 Output ONLY JSON, no prose, no code fences:
-{"status": "full|partial|none"}"""
+{"statuses": [{"chunk": 1, "status": "full|partial|none"}, ...]}
+Return exactly one status for every input chunk, in the same order."""
 
 _SUMMARIZE_SYSTEM = """You are given a sub-question and NUMBERED chunks that DO answer it.
 Answer the sub-question from those chunks only — concise and factual, no speculation, no outside
@@ -285,10 +287,8 @@ invent facts.
 - Take the already-asked list into account. If the missing item was already searched for and found
   nothing, say so explicitly ("X is missing; it was already searched for via <sub-question> and no
   evidence was found"), so the next planning step tries a DIFFERENT angle instead of repeating it.
-- Set "exhausted" to true when every plausible angle for the missing item has already been asked and
-  failed — i.e. more rounds are unlikely to help.
 Output ONLY JSON, no prose, no code fences:
-{"missing": "<what is still missing, or empty>", "exhausted": true/false}"""
+{"missing": "<what is still missing, or empty>"}"""
 
 _NEXT_SUBQ_SYSTEM = """The facts gathered so far do NOT yet answer the ORIGINAL question. You are given
 what is still missing and EVERY sub-question already asked. Plan the NEXT round.
@@ -339,7 +339,6 @@ class KwV4State(TypedDict, total=False):
     max_iterations: int
     sufficient: bool
     partial: bool
-    exhausted: bool  # every angle for the remaining gap has already been tried
     missing: str
     final_answer: str
 
@@ -413,22 +412,86 @@ def build_keyword_agentic_graph_v4(
         listing = "\n\n".join(f"[{i + 1}] " + (c.get("content_with_weight") or c.get("content") or "") for i, c in enumerate(shown))
         return shown, listing
 
-    async def _assess_one(question: str, chunk: dict) -> str:
-        """Judge a SINGLE chunk: 'full' | 'partial' | 'none'."""
-        body = "Title: " + chunk.get("docnm_kwd", "") + "\n--------------------------\n" + (chunk.get("content_with_weight") or chunk.get("content") or "").strip()
-        if not body:
-            return "none"
-        parsed = await _llm_json(_ASSESS_SYSTEM, f"Chunk:\n{body}\n\nSub-question:\n{question}\n\nOutput JSON:")
-        status = str(parsed.get("status") or "").strip().lower()
-        return status if status in ("full", "partial", "none") else "none"
+    def _assessment_body(chunk: dict) -> str:
+        title = str(chunk.get("docnm_kwd") or "")
+        content = str(chunk.get("content_with_weight") or chunk.get("content") or "").strip()
+        return "Title: " + title + "\n--------------------------\n" + content
+
+    def _assessment_prompt(question: str, bodies: list[str]) -> str:
+        listing = "\n\n".join(f"[{i + 1}] {body}" for i, body in enumerate(bodies))
+        return f"Sub-question:\n{question}\n\nConsecutive chunks:\n{listing}\n\nOutput JSON:"
+
+    def _assessment_budget() -> int:
+        max_length = int(getattr(tools.chat_mdl, "max_length", 8192) or 8192)
+        return max(1, int(max_length * 0.2))
+
+    def _assessment_batches(question: str, chunks: list[dict]) -> list[list[tuple[int, dict, str]]]:
+        """Group adjacent chunks while keeping the full assessment prompt below 20% of context."""
+        budget = _assessment_budget()
+        batches: list[list[tuple[int, dict, str]]] = []
+        current: list[tuple[int, dict, str]] = []
+
+        for index, chunk in enumerate(chunks):
+            body = _assessment_body(chunk)
+            candidate_bodies = [item[2] for item in current] + [body]
+            candidate_prompt = _assessment_prompt(question, candidate_bodies)
+            candidate_tokens = num_tokens_from_string(_ASSESS_SYSTEM + candidate_prompt)
+
+            if current and candidate_tokens > budget:
+                batches.append(current)
+                current = []
+                candidate_bodies = [body]
+                candidate_prompt = _assessment_prompt(question, candidate_bodies)
+                candidate_tokens = num_tokens_from_string(_ASSESS_SYSTEM + candidate_prompt)
+
+            if not current and candidate_tokens > budget:
+                fixed_prompt = _assessment_prompt(question, [""])
+                body_budget = max(1, budget - num_tokens_from_string(_ASSESS_SYSTEM + fixed_prompt))
+                body = truncate(body, body_budget)
+                candidate_tokens = num_tokens_from_string(_ASSESS_SYSTEM + _assessment_prompt(question, [body]))
+                if candidate_tokens > budget:
+                    _LOG.warning(
+                        "[Assess] single chunk prompt exceeds assessment budget: %d > %d tokens",
+                        candidate_tokens,
+                        budget,
+                    )
+
+            current.append((index, chunk, body))
+
+        if current:
+            batches.append(current)
+        return batches
+
+    async def _assess_batch(question: str, batch: list[tuple[int, dict, str]]) -> list[str]:
+        """Judge a consecutive batch and return one ``full|partial|none`` status per chunk."""
+        prompt = _assessment_prompt(question, [item[2] for item in batch])
+        parsed = await _llm_json(_ASSESS_SYSTEM, prompt)
+        raw_statuses = parsed.get("statuses") if isinstance(parsed, dict) else []
+        statuses = ["none"] * len(batch)
+        if not isinstance(raw_statuses, list):
+            return statuses
+
+        for position, item in enumerate(raw_statuses):
+            status_position = position
+            if isinstance(item, dict):
+                try:
+                    status_position = int(item.get("chunk", item.get("index", position + 1))) - 1
+                except (TypeError, ValueError):
+                    status_position = position
+                status = str(item.get("status") or "").strip().lower()
+            else:
+                status = str(item or "").strip().lower()
+            if 0 <= status_position < len(statuses) and status in ("full", "partial", "none"):
+                statuses[status_position] = status
+        return statuses
 
     async def _assess_chunks(question: str, chunks: list[dict]) -> tuple[str, list[dict]]:
-        """Walk the chunks ONE BY ONE, keeping the useful ones.
+        """Assess adjacent chunks in bounded batches, keeping the useful ones.
 
-        Stops at the first chunk that FULLY answers the sub-question — later chunks
-        are then never judged, which is what makes the per-chunk pass affordable.
-        Chunks judged ``partial`` are collected and the walk continues, so several
-        partials can together support an answer.
+        Each batch contains consecutive chunks and is sized from the selected LLM's
+        context window. Chunks judged ``partial`` are collected and the walk
+        continues, so several partials can together support an answer. The batch
+        containing the first ``full`` result is the last batch assessed.
 
         Returns ``(status, useful chunks)`` where status is ``"full"`` when some
         chunk answered outright, ``"partial"`` when only partial chunks were found,
@@ -440,16 +503,19 @@ def build_keyword_agentic_graph_v4(
         useful: list[dict] = []
         picked: list[str] = []
         status_out = "none"
-        for i, ck in enumerate(shown):
-            status = await _assess_one(question, ck)
-            if status == "none":
-                continue
-            useful.append(ck)
-            picked.append(f"{i + 1}:{status}")
-            if status == "full":
-                status_out = "full"
-                break  # this chunk alone answers it — stop judging the rest
-            status_out = "partial"
+        for batch in _assessment_batches(question, shown):
+            statuses = await _assess_batch(question, batch)
+            for (index, chunk, _), status in zip(batch, statuses, strict=True):
+                if status == "none":
+                    continue
+                useful.append(chunk)
+                picked.append(f"{index + 1}:{status}")
+                if status == "full":
+                    status_out = "full"
+                else:
+                    status_out = "partial" if status_out != "full" else status_out
+            if status_out == "full":
+                break
         if picked:
             _LOG.info("[Assess] %s — useful chunk(s) %s of %d for: %s", status_out.upper(), ", ".join(picked), len(shown), _snip(question))
         return status_out, useful
@@ -521,7 +587,7 @@ def build_keyword_agentic_graph_v4(
         subqs = _mk_subqs(parsed.get("subquestions"), 0, limit=_MAX_ANALYZE_SUBQUESTIONS) or _mk_subqs([{"question": q}], 0, limit=_MAX_ANALYZE_SUBQUESTIONS)
         for sq in subqs:
             _LOG.info("[Sub-Q]: %s", sq["question"])
-        return {"subquestions": subqs, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False, "exhausted": False}
+        return {"subquestions": subqs, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False}
 
     # ── Node 2: keywords — search terms + synonyms + number/date variants (LLM) ──
     async def keywords_node(state: KwV4State) -> dict:
@@ -655,7 +721,6 @@ def build_keyword_agentic_graph_v4(
         # plus the already-asked list, so the gap is described in terms of what has
         # actually been tried instead of being restated identically every round.
         missing = ""
-        exhausted = False
         if not sufficient:
             asked = state.get("asked") or []
             status_of = {_norm(e["subq"]): e.get("status", "full") for e in evidences}
@@ -669,14 +734,9 @@ def build_keyword_agentic_graph_v4(
                 missing_prompt + f"\n\nOriginal question:\n{state.get('question') or ''}\n\nIn order to answer the original question. Tell me what is missing.",
             )
             missing = str(missing_verdict.get("missing") or "").strip()
-            # Only trust "exhausted" once something has actually been tried — on the
-            # first round nothing has been searched yet, so it cannot be exhausted.
-            exhausted = bool(missing_verdict.get("exhausted")) and bool(asked)
-            if exhausted:
-                _LOG.info("[Sufficiency] every angle for the remaining gap has already been tried — answering partially instead of spending another round.")
         it = state.get("iteration", 0) + 1
-        _LOG.info("[Sufficiency] round %d → sufficient=%s, exhausted=%s. Missing: %s", it, sufficient, exhausted, _snip(missing))
-        return {"sufficient": sufficient, "missing": missing, "exhausted": exhausted, "iteration": it}
+        _LOG.info("[Sufficiency] round %d → sufficient=%s. Missing: %s", it, sufficient, _snip(missing))
+        return {"sufficient": sufficient, "missing": missing, "iteration": it}
 
     # ── Node 10: next_subq — plan the next round from the asked records (LLM) ──
     async def next_subq_node(state: KwV4State) -> dict:
@@ -756,9 +816,7 @@ def build_keyword_agentic_graph_v4(
     def _route_after_sufficiency(state: KwV4State) -> str:
         if state.get("sufficient"):
             return "answer"
-        # Exhausted == every angle for the gap has already been tried, so planning
-        # another round would only re-derive a dead end. Answer with what we have.
-        if state.get("exhausted") or state.get("iteration", 0) >= max_iterations:
+        if state.get("iteration", 0) >= max_iterations:
             return "answer_partial"
         return "next_subq"
 
@@ -796,7 +854,7 @@ def build_keyword_agentic_graph_v4(
 async def run_keyword_agentic_rag_v4(
     tools,
     messages: list,
-    max_iterations: int = 3,
+    max_iterations: int = 4,
     enable_snippets: bool = False,
     enable_deep_scan: bool = False,
     gen_conf: dict | None = None,
@@ -823,7 +881,7 @@ async def run_keyword_agentic_rag_v4(
     async def _drive():
         try:
             holder["state"] = await graph.ainvoke(
-                {"question": question, "max_iterations": max_iterations, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False, "exhausted": False},
+                {"question": question, "max_iterations": max_iterations, "iteration": 0, "pool": [], "evidences": [], "asked": [], "partial": False},
                 {"recursion_limit": max(25, max_iterations * 8 + 10)},
             )
         except Exception:

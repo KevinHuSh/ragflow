@@ -568,6 +568,13 @@ class Dealer:
         ranks = {"total": 0, "chunks": [], "doc_aggs": {}}
         if not question:
             return ranks
+        if isinstance(tenant_ids, str):
+            tenant_ids = [tid.strip() for tid in tenant_ids.split(",") if tid.strip()]
+        else:
+            tenant_ids = [tid for tid in (tenant_ids or []) if tid]
+        if not tenant_ids or not kb_ids:
+            logging.debug("[Search] skipped retrieval: tenant_ids or kb_ids is empty")
+            return ranks
 
         # Candidate window for block-based pagination. It MUST stay a multiple
         # of page_size so the block fetched (global_offset // RERANK_LIMIT) and
@@ -591,9 +598,6 @@ class Dealer:
         if isinstance(must_not, dict) and must_not:
             req["must_not"] = must_not
         logging.debug(f"[Search] global_offset={global_offset}, rerank_limit={RERANK_LIMIT}, page_size={page_size}, page={page}")
-
-        if isinstance(tenant_ids, str):
-            tenant_ids = tenant_ids.split(",")
 
         idx_names = [index_name(tid) for tid in tenant_ids]
         min_match = vector_similarity_weight < 0.8
