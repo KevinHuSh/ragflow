@@ -250,7 +250,7 @@ def _flatten_chunk_tables(chunks: list[dict]) -> list[dict]:
     changed = 0
     for c in chunks:
         body = c.get("content_with_weight") or ""
-        flat = body  # _flatten_tables(body)
+        flat = _flatten_tables(body)
         if flat != body:
             c = dict(c)
             c["content_with_weight"] = flat
