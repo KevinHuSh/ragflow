@@ -3,6 +3,7 @@
 import logging
 import re
 import hashlib
+from functools import lru_cache
 from common import settings
 from .navigation import _kg_scopes
 
@@ -169,25 +170,127 @@ def _split_sentences(text: str) -> list[str]:
     return sents
 
 
-def _narrow_content(content: str, kwds: list[str]) -> str | None:
-    """Return ``content`` narrowed to keyword sentences +/- 1 neighbour.
+# Inflection-tolerant matching.
+#
+# Plain substring matching only fires when the keyword is a PREFIX of the word in
+# the text: "headline" finds "headlined", but "headlined" misses "headline", and
+# "nominations" misses "nominated". Keywords are derived from the question, which
+# states things in the inflected form ("which band HEADLINED", "was NOMINATED
+# three times"), so the failing direction is the common one. Both sides are
+# therefore reduced to a stem before comparison.
+try:  # available at runtime — nltk already backs rag/nlp/synonym.py
+    from nltk.stem import PorterStemmer as _PorterStemmer
 
+    _porter_stem = _PorterStemmer().stem
+except Exception:  # pragma: no cover - exercised only where nltk is absent
+    _porter_stem = None
+
+# Longest first: "nominations" must lose "ations", not just the trailing "s".
+_STEM_SUFFIXES = (
+    ("ations", ""),
+    ("ation", ""),
+    ("ated", ""),
+    ("ates", ""),
+    ("ate", ""),
+    ("ings", ""),
+    ("ing", ""),
+    ("ies", "i"),
+    ("ied", "i"),
+    ("ed", ""),
+    ("es", ""),
+    ("s", ""),
+)
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _fallback_stem(word: str) -> str:
+    """Suffix stripper used when nltk is unavailable. Approximates Porter."""
+    w = word
+    for suffix, replacement in _STEM_SUFFIXES:
+        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
+            w = w[: len(w) - len(suffix)] + replacement
+            break
+    if len(w) > 3 and w.endswith("y"):
+        w = w[:-1] + "i"
+    if len(w) > 3 and w.endswith("e"):
+        w = w[:-1]
+    if len(w) > 3 and w[-1] == w[-2] and w[-1] not in "aeiou":
+        w = w[:-1]  # running -> runn -> run
+    return w
+
+
+@lru_cache(maxsize=8192)
+def _stem(word: str) -> str:
+    return _porter_stem(word) if _porter_stem else _fallback_stem(word)
+
+
+def _stemmable(token: str) -> bool:
+    """Only plain ASCII words are stemmed.
+
+    Identifiers ("1344259", "2020-21"), notation ("PPG") and CJK text must match
+    verbatim — stemming would corrupt them, and it has no meaning for Chinese.
+    """
+    return len(token) >= 4 and token.isascii() and token.isalpha()
+
+
+def _keyword_forms(kwds: list[str]) -> tuple[list[str], list[tuple[str, ...]]]:
+    """Split keywords into verbatim substrings and stem sequences."""
+    verbatim: list[str] = []
+    stemmed: list[tuple[str, ...]] = []
+    for kw in kwds or []:
+        k = (kw or "").strip().lower()
+        if not k:
+            continue
+        tokens = _WORD_RE.findall(k)
+        if tokens and all(_stemmable(t) for t in tokens):
+            stemmed.append(tuple(_stem(t) for t in tokens))
+        else:
+            verbatim.append(k)
+    return verbatim, stemmed
+
+
+def _sentence_stems(sentence: str) -> list[str]:
+    return [_stem(t) if _stemmable(t) else t for t in _WORD_RE.findall(sentence.lower())]
+
+
+def _sentence_matches(low: str, stems: list[str], verbatim: list[str], stemmed: list[tuple[str, ...]]) -> bool:
+    if any(v in low for v in verbatim):
+        return True
+    for seq in stemmed:
+        width = len(seq)
+        for start in range(len(stems) - width + 1):
+            if tuple(stems[start : start + width]) == seq:
+                return True
+    return False
+
+
+def _narrow_content(content: str, kwds: list[str]) -> str | None:
+    """Return ``content`` narrowed to keyword sentences +/- 5 neighbours.
+
+    Matching is inflection-tolerant: a keyword matches any word sharing its stem,
+    so "nominations" finds "nominated" and "company" finds "companies".
     Returns ``None`` when no keyword occurs anywhere in ``content``.
     """
     sents = _split_sentences(content)
     if not sents:
         return None
+    verbatim, stemmed = _keyword_forms(kwds)
+    if not verbatim and not stemmed:
+        return None
     keep: set[int] = set()
     matched = False
     for i, s in enumerate(sents):
-        low = s.lower()
-        if any(kw in low for kw in kwds):
+        if _sentence_matches(s.lower(), _sentence_stems(s), verbatim, stemmed):
             matched = True
-            if i > 0:
-                keep.add(i - 1)
             keep.add(i)
-            if i + 1 < len(sents):
-                keep.add(i + 1)
+            # max(-1, ...) so sentence 0 is reachable and the backward window is
+            # 5 wide, matching the forward one; max(0, ...) excluded index 0
+            # outright, so a chunk's opening sentence could never be context.
+            for j in range(i - 1, max(-1, i - 6), -1):
+                keep.add(j)
+            for j in range(i + 1, min(i + 6, len(sents))):
+                keep.add(j)
     if not matched:
         return None
     narrowed = "".join(sents[i] for i in sorted(keep)).strip()
@@ -195,10 +298,20 @@ def _narrow_content(content: str, kwds: list[str]) -> str | None:
 
 
 def _highlight_keywords(text: str, kwds: list[str]) -> str:
-    terms = sorted({kw for kw in kwds if kw}, key=len, reverse=True)
+    """Star the verbatim keywords AND any word sharing a keyword's stem."""
+    verbatim, stemmed = _keyword_forms(kwds)
+    stem_set = {s for seq in stemmed for s in seq}
+    terms = {t for t in verbatim if t}
+    if stem_set:
+        for word in re.findall(r"[A-Za-z]+", text):
+            low = word.lower()
+            if _stemmable(low) and _stem(low) in stem_set:
+                terms.add(word)
     if not terms:
         return text
-    pattern = re.compile("|".join(re.escape(term) for term in terms), re.IGNORECASE)
+    # Longest first so a phrase wins over a word it contains; one pass, so an
+    # already-starred span is never starred again.
+    pattern = re.compile("|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)), re.IGNORECASE)
     return pattern.sub(lambda m: f"*{m.group(0)}*", text)
 
 

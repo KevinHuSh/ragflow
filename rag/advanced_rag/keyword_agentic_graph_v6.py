@@ -1,0 +1,728 @@
+#
+#  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+
+"""Keyword-driven iterative search graph — v6 (LangGraph).
+
+A deliberately small chain-of-thought baseline. Where v5 fans out into a batch
+of sub-questions per round and carries classification, arithmetic, structural
+expansion and an exhaustion ledger, v6 keeps exactly ONE question in flight and
+loops: ask it, search it, answer it if the chunks allow, otherwise think of the
+next question. Every round adds at most one evidence, and the final answer is
+composed from the evidence list.
+
+Flow:
+
+    formalize → keywords → retrieve → assess → sufficiency ─(yes)──→ answer → END
+                   ↑                             │
+                   └────── next_question ←───────┘(no)
+                                └─(nothing new | out of rounds)→ answer
+
+Two simplifications are deliberate, and both cost something:
+
+* The search query is UNCAPPED — every keyword, synonym and date/number variant
+  goes into one query string. That maximises surface coverage, but BM25 mass is
+  spread across the terms, so a rare literal (a patent number, a catalogue id)
+  ranks lower than it would as a query on its own.
+* There is NO structural expansion. Chunks are assessed exactly as retrieved, so
+  a fact sitting one chunk away from its match is not reached, and no section
+  heading is attached — meaning v6 cannot tell that a chunk came from a
+  ``## References`` list rather than from the body of an article.
+
+v5 remains the richer graph; v6 exists to measure how much of v5's accuracy
+comes from its machinery rather than from the underlying retrieval.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from common.token_utils import num_tokens_from_string
+from rag.prompts.generator import citation_prompt, form_message, message_fit_in
+from rag.advanced_rag.harness.prompts.report_prompt import FINAL_ANSWER_SYSTEM
+from rag.advanced_rag.harness.tools.search import _narrow_by_keywords, _normalize
+
+# Stable pure helpers reused from v1 (no behavioural coupling).
+from rag.advanced_rag.keyword_agentic_graph import (
+    _chunk_id,
+    _doc_aggs_from,
+    _extract_json,
+    _norm,
+    _snip,
+)
+
+# Deterministic number/word hints are identical to v4's.
+
+# Table flattening (including the banner-row handling) is shared with v5.
+from rag.advanced_rag.keyword_agentic_graph_v5 import _flatten_chunk_tables
+
+_LOG = logging.getLogger(__name__)
+
+# Tunable caps.
+_CHUNKS_PER_QUERY = 8  # chunks retrieved per round (higher than v5: nothing inflates them here)
+_NEEDLE_REPEAT = 5  # copies of each rare literal appended to the query
+_MAX_NEEDLES = 3  # rare literals weighted per round
+
+# A "needle" is a term whose value lies in being RARE: a bare identifier (patent
+# 1344259, ISBN, case number) or a notation abbreviation (PPG, EPS, GDP). Inside a
+# long combined query its signal is spread across a dozen commoner terms and it
+# stops discriminating — the exact failure that buried both a patent number and a
+# statistics table whose only distinguishing token was "PPG".
+#
+# The fix is to weight it up inside the SAME query rather than to run a second one.
+# ``term_weight.weights`` keeps duplicate tokens and then normalises every weight by
+# their sum, so with R the raw weight of everything else, k copies of a needle claim
+# k*w / (R + k*w) of the query's mass instead of w / (R + w). That is larger for
+# every k > 1 and rises monotonically toward 1, so no threshold applies — five
+# copies take a needle from ~9% of a six-term query to ~33%.
+# One query, one ranked result set, no merge step.
+# A run of five or more digits, so patent/ISBN/case numbers qualify but years and
+# season ranges ("2020", "2020-21") do not — those are far too common to probe.
+_NEEDLE_IDENTIFIER = re.compile(r"\d{5,}")
+_NEEDLE_ABBREVIATION = re.compile(r"^[A-Z][A-Z0-9./]{1,7}$")
+# Ordinary words that happen to be short and capitalised are not notation.
+_NEEDLE_STOPWORDS = {"I", "A", "AN", "THE", "US", "USA", "UK", "TV", "OK", "NBA", "NFL", "MLB", "NHL"}
+
+
+def _needle_terms(keywords: str) -> list[str]:
+    """Rare literals worth a dedicated BM25 probe, in query order, deduped."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (keywords or "").split(","):
+        term = raw.strip()
+        if not term or " " in term or term.upper() in _NEEDLE_STOPWORDS:
+            continue
+        if not (_NEEDLE_IDENTIFIER.search(term) or _NEEDLE_ABBREVIATION.match(term)):
+            continue
+        key = term.upper()
+        if key not in seen:
+            seen.add(key)
+            out.append(term)
+        if len(out) >= _MAX_NEEDLES:
+            break
+    return out
+
+
+_KEYWORDS_SYSTEM = """You turn ONE question into a search query for a keyword/BM25 search engine.
+
+Return the terms that would appear VERBATIM in a document that answers the question, together with
+their close synonyms and alternative surface forms. Include ALL of:
+- the distinctive nouns, proper names, titles and identifiers in the question;
+- a close synonym or alternative phrasing for each, where a source might word it differently;
+- EVERY alternative expression of any DATE or NUMBER in the question. Ordinals and their words
+  ("21st" -> "twenty-first"), digits and their words ("2000000" -> "two million", "2 million"),
+  and each common date format ("Aug 2nd" -> "August 2", "2 August", "08-02").
+Normalization hints may be supplied below; fold every one of them into the list.
+
+SOURCES TABULATE WHAT QUESTIONS SPELL OUT. A statistic named in prose is usually written in a table
+as a column abbreviation, and the prose wording may not appear in the document at all. Whenever the
+question names a measure, emit the ABBREVIATIONS a table would use alongside it:
+  "points per game" -> "PPG", "PTS";   "rebounds per game" -> "RPG";   "earnings per share" -> "EPS";
+  "gross domestic product" -> "GDP";   "games played" -> "GP";   "market capitalisation" -> "market cap".
+Do the same for a superlative that a table expresses as a plain column: "leading scorer" is found by
+looking for "PTS" and "PPG", not by looking for the phrase "leading scorer".
+
+A bare identifier — a serial, patent, catalogue or case number — is a complete keyword on its own.
+Emit it as its own term; never glue it to surrounding words.
+Do NOT include question words ("which", "who", "when", "how many") or generic filler ("information").
+Output ONLY JSON, no prose, no code fences:
+{"keywords": ["<term>", "<term>", ...]}"""
+
+_ASSESS_SYSTEM = """You are given a QUESTION and a consecutive, numbered batch of chunks.
+Judge EACH chunk independently. Do NOT write the answer here.
+- "full"    — this chunk ALONE completely answers the question: it states the specific value asked
+              for (the date, number, name, ...), OR that value follows from figures stated in THIS
+              chunk by a trivial, certain derivation (see below).
+- "partial" — this chunk contributes a genuinely relevant fact, but does not state the value asked
+              for and does not force it arithmetically.
+- "none"    — this chunk does not help answer the question.
+
+A TRIVIAL, CERTAIN derivation is arithmetic forced by the stated figures, never a guess: the
+complement of a share of one whole, a unit conversion, or the sum/difference of figures stated in
+the chunk. Anything needing an outside fact, an estimate or an assumption is NOT trivial — judge
+that "partial".
+
+Do not guess, and do not use outside knowledge. Judge only the chunk in front of you, not what
+another chunk might say. Do not assume a list truncated mid-way continues with what you expect.
+Output ONLY JSON, no prose, no code fences:
+{"statuses": [{"chunk": 1, "status": "full|partial|none"}, ...]}
+Return exactly one status for every input chunk, in the same order."""
+
+_BRIEF_ANSWER_SYSTEM = """You are given a QUESTION, the ORIGINAL question that the research serves,
+and numbered chunks that DO answer the QUESTION.
+
+Answer the QUESTION from those chunks only — one or two sentences, factual, no speculation, no
+outside knowledge, no reasoning shown.
+- Keep every detail the ORIGINAL question will later need: exact dates, exact numbers, full names,
+  units. A summary that drops the figure is useless to the step that follows.
+- If the QUESTION asks for a set or a list, name EVERY member the chunks state, not just the first.
+- Answer the question that was ASKED. If the chunks state a closely related figure instead, give the
+  asked-for value only when it follows from them by a trivial, certain derivation, and say which
+  figure it came from. Otherwise state plainly what the chunks do say.
+- "relevant": the NUMBERS of the chunks your answer rests on.
+Output ONLY JSON, no prose, no code fences:
+{"answer": "<one or two factual sentences>", "relevant": [<chunk number>, ...]}"""
+
+_SUFFICIENCY_SYSTEM = """You are given the ORIGINAL question and every fact discovered so far.
+Decide ONLY whether those facts are enough to answer the ORIGINAL question completely and directly.
+Do NOT propose follow-up research and do NOT answer the question.
+
+- "sufficient" is true only when EVERY part of the ORIGINAL question can be answered from the facts.
+- Never assume, infer, or fill in a value that no fact states.
+- If the question joins two conditions ("which X did A and also B"), the facts are sufficient only
+  when a SINGLE entity is shown to satisfy both. Two facts naming DIFFERENT entities are a
+  contradiction to resolve, not an answer.
+Output ONLY JSON, no prose, no code fences:
+{"sufficient": true/false}"""
+
+_NEXT_QUESTION_SYSTEM = """The facts gathered so far do NOT answer the ORIGINAL question. You are
+given the ORIGINAL question, the facts discovered, and every question ALREADY ASKED. Plan the ONE
+question to ask next.
+
+- SIMPLE and ATOMIC: one fact, one entity, one relation. Never bundle two hops into one question.
+- USE THE FACTS ALREADY DISCOVERED. When an earlier round resolved a value, SUBSTITUTE it into the
+  next question — that is how a multi-hop question makes progress. If a fact says the city is
+  "Baltimore", ask "When was Baltimore founded?", never "When was that city founded?".
+- Never use an unresolved reference ("that city", "it", "the person"). Name the entity in full,
+  with any ranking, date or location condition the question attaches to it.
+- KEEP THE ORIGINAL QUESTION'S WORDING for the thing being asked. Do not swap in a near-synonym that
+  means something else ("make up" is not "own", "worth" is not "earned"): sources tend to state a
+  fact in the asker's own phrasing, so re-wording it loses the text that holds the answer.
+- NEVER repeat or rephrase anything under "Already asked" — those rounds are spent. Attack the gap
+  from a genuinely different angle: a different entity, source or attribute.
+- If no genuinely NEW and useful question exists — every angle is spent, or the sources plainly
+  cannot supply what is missing — return an EMPTY question. That is the CORRECT answer in that case;
+  never pad it with a variation of something already asked.
+Output ONLY JSON, no prose, no code fences:
+{"question": "<the next question, or an empty string>"}"""
+
+_NO_REASONING_RULE = (
+    "\n\n# Output Discipline\n"
+    "Emit ONLY the finished answer. The reader sees your entire reply, so it must contain no "
+    "deliberation: no numbered walk-through of the steps, no 'Let me work through this', no "
+    "'the evidence tells us', no narration of what you decided to state or withhold, and no "
+    "restatement of the question. Lead with the answer itself, then any brief supporting detail. "
+    "If part of the question is unresolved, say so in one sentence — do not explain how you "
+    "arrived at that conclusion."
+)
+
+_BEST_EFFORT_RULE = (
+    "\n\n# Iteration-Limit Best Estimate\n"
+    "Research reached its limit with a factor unresolved. The instruction not to guess is relaxed "
+    "ONLY for a single clearly labelled best-supported inference. Base it on the findings, mark it "
+    "plainly as an inference rather than a confirmed fact, and never invent a source, citation, "
+    "figure or date."
+)
+
+_BEST_EFFORT_PREAMBLE = (
+    "Research reached its iteration limit before every part of the question could be verified. Give "
+    "the most plausible complete answer the findings support, making ONE best-supported inference "
+    "for the unresolved factor. Label that part explicitly as a best estimate and state what remains "
+    "unverified. Never fabricate a source, citation, exact figure, or date."
+)
+
+_PARTIAL_PREAMBLE = (
+    "The evidence below is INCOMPLETE — research ran out of new angles before every part of the "
+    "question could be resolved. Answer the parts that the evidence does support, and state plainly "
+    "which part remains unresolved. Do not guess the missing part."
+)
+
+
+class KwV6State(TypedDict, total=False):
+    question: str  # the raw last user message
+    formalized: str  # the standalone question rebuilt from the conversation
+    current: str  # the question being researched THIS round
+    keywords: str  # search terms for `current`
+    chunks: list  # chunks retrieved for `current`
+    evidences: list  # [{iteration, question, answer, chunk_ids}]
+    asked: list  # questions attempted that produced no evidence
+    pool: list  # retained chunks — the citation set, dedup by id
+    iteration: int
+    max_iterations: int
+    sufficient: bool
+    partial: bool
+    final_answer: str
+
+
+def _numbered(chunks: list[dict]) -> str:
+    """Render chunks as a 1-based numbered listing for the assessor."""
+    return "\n\n".join(f"[{i + 1}] Title: {c.get('docnm_kwd') or ''}\n{(c.get('content_with_weight') or c.get('content') or '').strip()}" for i, c in enumerate(chunks))
+
+
+def _facts_listing(evidences: list[dict]) -> str:
+    """Render the evidence for the planner, flagging facts built only from partials.
+
+    A brief assembled from "partial" chunks answered around the question rather
+    than stating the value, so the planner must be able to tell it apart from a
+    settled fact — otherwise it moves on as though the hop were closed.
+    """
+    lines = []
+    for e in evidences:
+        mark = "   [PARTIAL — no chunk stated the value outright]" if e.get("status") == "partial" else ""
+        lines.append(f"(round {e.get('iteration', 0)}) {e['question']}{mark}\n-> {e['answer']}")
+    return "\n\n".join(lines) or "(nothing discovered yet)"
+
+
+def _pick(chunks: list[dict], numbers: object) -> list[dict]:
+    """Resolve 1-based chunk numbers from an LLM response to chunk dicts."""
+    out, seen = [], set()
+    for n in numbers if isinstance(numbers, list) else []:
+        try:
+            idx = int(n) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < len(chunks) and idx not in seen:
+            seen.add(idx)
+            out.append(chunks[idx])
+    return out
+
+
+def build_keyword_agentic_graph_v6(
+    tools,
+    token_queue: asyncio.Queue,
+    messages: list | None = None,
+    gen_conf: dict | None = None,
+    max_iterations: int = 5,
+):
+    """Compile the v6 graph.
+
+    :param messages: the full conversation, used once to rebuild a standalone
+        question. Falls back to the raw question when unavailable.
+    :param max_iterations: rounds of (keywords → retrieve → assess) before the
+        graph answers with whatever evidence it has.
+    """
+    answer_conf = dict(gen_conf) if gen_conf else {"temperature": 0.3}
+    answer_conf.pop("direct_answer", None)
+
+    async def _llm_json(system: str, user: str) -> dict:
+        msg = await tools._fit_messages(system, user)
+        ans = await tools.chat_mdl.async_chat(msg[0]["content"], msg[1:], {"temperature": 0.2})
+        if isinstance(ans, tuple):
+            ans = ans[0]
+        return _extract_json(ans)
+
+    # ── Node 1: formalize — rebuild a standalone question from the chat history ──
+    async def formalize_node(state: KwV6State) -> dict:
+        raw = state.get("question") or ""
+        formalized = raw
+        """
+        if messages:
+            try:
+                rebuilt = await full_question(messages=messages, chat_mdl=tools.chat_mdl)
+                if rebuilt and rebuilt.strip():
+                    formalized = rebuilt.strip()
+            except Exception:
+                _LOG.exception("[Formalize] failed; falling back to the raw question")
+        """
+        if _norm(formalized) != _norm(raw):
+            _LOG.info("[Formalize] %s  ->  %s", _snip(raw), _snip(formalized))
+        else:
+            _LOG.info("[Formalize] unchanged: %s", _snip(formalized))
+        return {
+            "formalized": formalized,
+            "current": formalized,
+            "iteration": 0,
+            "evidences": [],
+            "asked": [],
+            "pool": [],
+            "partial": False,
+        }
+
+    # ── Node 2: keywords — search terms, synonyms and date/number variants ──
+    async def keywords_node(state: KwV6State) -> dict:
+        current = state.get("current") or ""
+        # hints = _date_keyword_hints(current) + _number_keyword_hints(current)
+        user = f"Question:\n{current}"
+        # if hints:
+        #    user += "\n\nNormalization hints:\n" + "\n".join(f"- {h}" for h in hints)
+        parsed = await _llm_json(_KEYWORDS_SYSTEM, user + "\n\nOutput JSON:")
+        terms, seen = [], set()
+        for k in parsed.get("keywords") or []:
+            term = str(k).strip()
+            key = _norm(term)
+            if term and key not in seen:
+                seen.add(key)
+                terms.append(term)
+        keywords = ", ".join(terms) or current
+        _LOG.info("[Keywords] %s -> %s", _snip(current), _snip(keywords))
+        return {"keywords": keywords}
+
+    # ── Node 3: retrieve — one search, tables flattened (no LLM) ──
+    async def retrieve_node(state: KwV6State) -> dict:
+        from common import settings
+
+        if not getattr(tools, "tenant_ids", None) or not getattr(tools, "kb_ids", None):
+            _LOG.warning("[Retrieve] skipped: no tenant or knowledge-base scope is available.")
+            return {"chunks": []}
+
+        query = state.get("keywords") or state.get("current") or ""
+        doc_ids = tools.scoped_doc_ids(None) if hasattr(tools, "scoped_doc_ids") else None
+
+        # Weight the rare literals up inside this one query (see _NEEDLE_REPEAT).
+        needles = _needle_terms(query)
+        if needles:
+            query = ", ".join([query] + [n for n in needles for _ in range(_NEEDLE_REPEAT)])
+            _LOG.info("[Retrieve] needle(s) weighted x%d: %s", _NEEDLE_REPEAT, ", ".join(needles))
+
+        try:
+            kbinfos = await settings.retriever.retrieval(
+                query,
+                tools.embed_mdl,
+                tools.tenant_ids,
+                tools.kb_ids,
+                1,
+                _CHUNKS_PER_QUERY,
+                0.2,
+                vector_similarity_weight=0.3 if tools.embed_mdl else 0,
+                aggs=False,
+                highlight=False,
+                doc_ids=doc_ids,
+            )
+        except Exception:
+            _LOG.exception("[Retrieve] failed for: %s", _snip(query))
+            return {"chunks": []}
+
+        chunks = _flatten_chunk_tables((_normalize(kbinfos, tools.tenant_ids) or {}).get("chunks") or [])
+
+        # Narrow each chunk to the sentences carrying a keyword, plus their
+        # neighbours, and drop chunks holding no keyword at all. Block-level HTML and
+        # markdown tables are protected spans, so a table stays whole rather than
+        # being cut mid-row. Uses the ORIGINAL keyword list, not the needle-weighted
+        # query, whose repeated terms would only be split back out and deduped.
+        narrowed = _narrow_by_keywords(chunks, state.get("keywords") or "")
+        if narrowed:
+            _LOG.info("[Retrieve] narrowed %d chunk(s) to %d keyword-bearing.", len(chunks), len(narrowed))
+            chunks = narrowed
+        elif chunks:
+            # Keyword matching is verbatim substring; retrieval matches tokens. A
+            # chunk can be genuinely relevant without containing any keyword as
+            # written, so an empty narrowing means the filter was too strict here,
+            # not that the results were worthless.
+            _LOG.info("[Retrieve] narrowing removed every chunk; keeping the %d retrieved as-is.", len(chunks))
+
+        _LOG.info("[Retrieve] %d chunk(s) for: %s", len(chunks), _snip(state.get("current") or ""))
+        return {"chunks": chunks}
+
+    # ── Assessment (batched, budget-bounded) ──
+
+    def _assessment_body(chunk: dict) -> str:
+        title = str(chunk.get("docnm_kwd") or "")
+        content = str(chunk.get("content_with_weight") or chunk.get("content") or "").strip()
+        return "Title: " + title + "\n--------------------------\n" + content
+
+    def _assessment_prompt(question: str, bodies: list[str]) -> str:
+        listing = "\n\n".join(f"[{i + 1}] {body}" for i, body in enumerate(bodies))
+        return f"Question:\n{question}\n\nConsecutive chunks:\n{listing}\n\nOutput JSON:"
+
+    def _assessment_batches(question: str, chunks: list[dict]) -> list[list[tuple[int, dict, str]]]:
+        """Group adjacent chunks while keeping each assessment prompt inside the budget."""
+        budget = max(1, int(int(getattr(tools.chat_mdl, "max_length", 8192) or 8192) * 0.3))
+        batches: list[list[tuple[int, dict, str]]] = []
+        current: list[tuple[int, dict, str]] = []
+        for index, chunk in enumerate(chunks):
+            body = _assessment_body(chunk)
+            bodies = [item[2] for item in current] + [body]
+            if current and num_tokens_from_string(_ASSESS_SYSTEM + _assessment_prompt(question, bodies)) > budget:
+                batches.append(current)
+                current = []
+            current.append((index, chunk, body))
+        if current:
+            batches.append(current)
+        return batches
+
+    async def _assess_batch(question: str, batch: list[tuple[int, dict, str]]) -> list[str]:
+        """Judge one batch, returning a ``full|partial|none`` status per chunk."""
+        parsed = await _llm_json(_ASSESS_SYSTEM, _assessment_prompt(question, [item[2] for item in batch]))
+        raw = parsed.get("statuses") if isinstance(parsed, dict) else []
+        statuses = ["none"] * len(batch)
+        if not isinstance(raw, list):
+            return statuses
+        for position, item in enumerate(raw):
+            slot = position
+            if isinstance(item, dict):
+                try:
+                    slot = int(item.get("chunk", item.get("index", position + 1))) - 1
+                except (TypeError, ValueError):
+                    slot = position
+                status = str(item.get("status") or "").strip().lower()
+            else:
+                status = str(item or "").strip().lower()
+            if 0 <= slot < len(statuses) and status in ("full", "partial", "none"):
+                statuses[slot] = status
+        return statuses
+
+    async def _assess_chunks(question: str, chunks: list[dict]) -> tuple[str, list[dict]]:
+        """Assess chunks in bounded batches, keeping the useful ones.
+
+        Returns ``(status, useful chunks)``. Judging one chunk at a time stops a
+        single answer-bearing chunk from being outvoted by the bulk around it, and
+        the batch loop stops as soon as some chunk answers outright — later batches
+        cannot improve on "full". A result built only from partials is NOT settled:
+        the caller records the question as asked so the planner revisits it.
+        """
+        useful: list[dict] = []
+        picked: list[str] = []
+        status_out = "none"
+        for batch in _assessment_batches(question, chunks):
+            statuses = await _assess_batch(question, batch)
+            for (index, chunk, _), status in zip(batch, statuses):
+                if status == "none":
+                    continue
+                useful.append(chunk)
+                picked.append(f"{index + 1}:{status}")
+                if status == "full":
+                    status_out = "full"
+                elif status_out != "full":
+                    status_out = "partial"
+            if status_out == "full":
+                break
+        if picked:
+            _LOG.info("[Assess] %s — useful chunk(s) %s of %d for: %s", status_out.upper(), ", ".join(picked), len(chunks), _snip(question))
+        return status_out, useful
+
+    # ── Node 4: assess — judge each chunk, then brief the useful ones ──
+    async def assess_node(state: KwV6State) -> dict:
+        current = state.get("current") or ""
+        chunks = state.get("chunks") or []
+        it = state.get("iteration", 0)
+        asked = list(state.get("asked") or [])
+        evidences = list(state.get("evidences") or [])
+        pool = list(state.get("pool") or [])
+
+        def _give_up() -> dict:
+            if current and not any(_norm(a) == _norm(current) for a in asked):
+                asked.append(current)
+            return {"evidences": evidences, "asked": asked, "pool": pool}
+
+        if not chunks:
+            _LOG.info("[Assess] no chunks retrieved — recording the question as asked.")
+            return _give_up()
+
+        status, useful = await _assess_chunks(current, chunks)
+        if status == "none" or not useful:
+            _LOG.info("[Assess] INSUFFICIENT for: %s", _snip(current))
+            return _give_up()
+
+        # Brief only the USEFUL chunks. Judging and answering are separate jobs, and
+        # the brief is written knowing the ORIGINAL question it has to serve, so it
+        # keeps the exact date/number/name the later steps will need.
+        parsed = await _llm_json(
+            _BRIEF_ANSWER_SYSTEM,
+            f"Question:\n{current}\n\nORIGINAL question this serves:\n{state.get('formalized') or ''}\n\nChunks:\n{_numbered(useful)}\n\nOutput JSON:",
+        )
+        answer = str(parsed.get("answer") or "").strip()
+        if not answer:
+            _LOG.info("[Assess] useful chunks found but no brief was produced — recording the question as asked.")
+            return _give_up()
+
+        cited = _pick(useful, parsed.get("relevant")) or useful
+        seen = {_chunk_id(c) for c in pool}
+        for c in cited:
+            cid = _chunk_id(c)
+            if cid not in seen:
+                seen.add(cid)
+                pool.append(c)
+        evidences.append(
+            {
+                "iteration": it,
+                "question": current,
+                "answer": answer,
+                "status": status,
+                "chunk_ids": [_chunk_id(c) for c in cited],
+            }
+        )
+        _LOG.info("[Assess] ANSWERED (%s): %s -> %s", status, _snip(current), _snip(answer))
+        return {"evidences": evidences, "asked": asked, "pool": pool}
+
+    # ── Node 5: sufficiency — all evidence vs the original question ──
+    async def sufficiency_node(state: KwV6State) -> dict:
+        evidences = state.get("evidences") or []
+        facts = _facts_listing(evidences)
+        verdict = await _llm_json(
+            _SUFFICIENCY_SYSTEM,
+            f"Facts discovered so far:\n{facts}\n\nOriginal question:\n{state.get('formalized') or ''}\n\nOutput JSON:",
+        )
+        sufficient = bool(verdict.get("sufficient"))
+        it = state.get("iteration", 0) + 1
+        _LOG.info("[Sufficiency] round %d → sufficient=%s (%d evidence).", it, sufficient, len(evidences))
+        return {"sufficient": sufficient, "iteration": it, "partial": (not sufficient) and it >= max_iterations}
+
+    # ── Node 6: next_question — one simple, atomic follow-up ──
+    async def next_question_node(state: KwV6State) -> dict:
+        evidences = state.get("evidences") or []
+        asked = state.get("asked") or []
+        facts = _facts_listing(evidences)
+        # Everything attempted blocks a repeat: the failures in `asked`, and the
+        # questions that succeeded, which live on their evidence records.
+        attempted = list(asked) + [e["question"] for e in evidences]
+        parts = [
+            f"Original question:\n{state.get('formalized') or ''}",
+            f"Facts discovered so far:\n{facts}",
+        ]
+        if attempted:
+            parts.append("Already asked (never repeat or rephrase any of these):\n" + "\n".join(f"- {a}" for a in attempted))
+        parts.append("Output JSON:")
+
+        parsed = await _llm_json(_NEXT_QUESTION_SYSTEM, "\n\n".join(parts))
+        nxt = str(parsed.get("question") or "").strip()
+        if nxt and any(_norm(a) == _norm(nxt) for a in attempted):
+            _LOG.info("[Next question] discarded a repeat of an earlier question: %s", _snip(nxt))
+            nxt = ""
+        _LOG.info("[Next question] round %d → %s", state.get("iteration", 0), _snip(nxt) if nxt else "(none — answering with what is known)")
+        return {"current": nxt, "keywords": "", "chunks": [], "partial": not nxt}
+
+    # ── Node 7: answer — brief cited answer, full or partial (streamed) ──
+    async def answer_node(state: KwV6State) -> dict:
+        evidences = [e for e in (state.get("evidences") or []) if e.get("answer")]
+        if not evidences:
+            msg = "I don't have enough information based on the available sources."
+            token_queue.put_nowait(msg)
+            return {"final_answer": msg}
+
+        pool = state.get("pool") or []
+        tools.kbinfos = {"chunks": pool, "doc_aggs": _doc_aggs_from(pool)}
+        id_of = {_chunk_id(c): i for i, c in enumerate(pool)}
+
+        findings = []
+        for e in evidences:
+            ids = [id_of[cid] for cid in (e.get("chunk_ids") or []) if cid in id_of]
+            cite = " ".join(f"[ID:{i}]" for i in ids)
+            findings.append(f"- {e['question']}: {e['answer']}" + (f"  (cite: {cite})" if cite else ""))
+
+        system = FINAL_ANSWER_SYSTEM.format(cite_rules=citation_prompt(tools.user_defined_prompts).strip())
+        system += _NO_REASONING_RULE
+        head = f"Question:\n{state.get('formalized') or state.get('question') or ''}\n\n"
+        partial = bool(state.get("partial")) or not state.get("sufficient")
+        # Out of rounds with findings in hand is a different situation from having
+        # run out of angles: the graph stops asking, but a labelled inference from
+        # what was found beats discarding it.
+        best_effort = partial and state.get("iteration", 0) >= max_iterations
+        if best_effort:
+            system += _BEST_EFFORT_RULE
+            head += _BEST_EFFORT_PREAMBLE + "\n\n"
+        elif partial:
+            head += _PARTIAL_PREAMBLE + "\n\n"
+        body = (
+            "Answer from the findings below. Each finding shows the [ID:n] citation markers that "
+            "support it — reuse those exact markers in your answer; do not invent IDs.\n\n"
+            "Findings:\n" + "\n".join(findings)
+        )
+        if best_effort:
+            body += "\n\nMake ONE explicit best estimate for the unresolved factor, and only where the findings make it plausible. Present it as an inference, not a confirmed fact."
+        _, msg = message_fit_in(form_message(system, head + body), tools.chat_mdl.max_length)
+
+        mode = "BEST-EFFORT" if best_effort else ("PARTIAL" if partial else "Full")
+        _LOG.info("[Answer] %s answer from %d finding(s), citing a pool of %d chunk(s).", mode, len(findings), len(pool))
+        final = ""
+        try:
+            async for tok in tools.chat_mdl.async_chat_streamly_delta(msg[0]["content"], msg[1:], answer_conf):
+                token_queue.put_nowait(tok)
+                final += tok
+        except Exception:
+            _LOG.exception("[Answer] stream failed")
+            token_queue.put_nowait("I'm sorry, I encountered an error while composing the answer.")
+        return {"final_answer": final}
+
+    def _route_after_sufficiency(state: KwV6State) -> str:
+        if state.get("sufficient") or state.get("iteration", 0) >= max_iterations:
+            return "answer"
+        return "next_question"
+
+    def _route_after_next_question(state: KwV6State) -> str:
+        return "keywords" if state.get("current") else "answer"
+
+    g = StateGraph(KwV6State)
+    g.add_node("formalize", formalize_node)
+    g.add_node("keywords", keywords_node)
+    g.add_node("retrieve", retrieve_node)
+    g.add_node("assess", assess_node)
+    g.add_node("sufficiency", sufficiency_node)
+    g.add_node("next_question", next_question_node)
+    g.add_node("answer", answer_node)
+
+    g.add_edge(START, "formalize")
+    g.add_edge("formalize", "keywords")
+    g.add_edge("keywords", "retrieve")
+    g.add_edge("retrieve", "assess")
+    g.add_edge("assess", "sufficiency")
+    g.add_conditional_edges("sufficiency", _route_after_sufficiency, {"next_question": "next_question", "answer": "answer"})
+    g.add_conditional_edges("next_question", _route_after_next_question, {"keywords": "keywords", "answer": "answer"})
+    g.add_edge("answer", END)
+    return g.compile()
+
+
+async def run_keyword_agentic_rag_v6(
+    tools,
+    messages: list,
+    max_iterations: int = 13,
+    gen_conf: dict | None = None,
+):
+    """Drive the v6 graph, yielding answer-token strings."""
+    question = ""
+    for m in reversed(messages or []):
+        if m.get("role") == "user" and m.get("content"):
+            question = m["content"]
+            break
+
+    token_queue: asyncio.Queue = asyncio.Queue()
+    graph = build_keyword_agentic_graph_v6(
+        tools,
+        token_queue,
+        messages=messages,
+        gen_conf=gen_conf,
+        max_iterations=max_iterations,
+    )
+    _SENTINEL = object()
+    holder: dict[str, Any] = {}
+
+    async def _drive():
+        try:
+            holder["state"] = await graph.ainvoke(
+                {
+                    "question": question,
+                    "max_iterations": max_iterations,
+                    "iteration": 0,
+                    "evidences": [],
+                    "asked": [],
+                    "pool": [],
+                    "partial": False,
+                },
+                {"recursion_limit": max(25, max_iterations * 8 + 10)},
+            )
+        except Exception:
+            _LOG.exception("run_keyword_agentic_rag_v6: graph execution failed")
+            holder["error"] = True
+        finally:
+            token_queue.put_nowait(_SENTINEL)
+
+    task = asyncio.create_task(_drive())
+    produced = False
+    try:
+        while True:
+            item = await token_queue.get()
+            if item is _SENTINEL:
+                break
+            produced = True
+            yield item
+    finally:
+        await task
+
+    if not produced and holder.get("error"):
+        yield "I couldn't complete the search due to an internal error."

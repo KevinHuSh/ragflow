@@ -250,7 +250,7 @@ def _flatten_chunk_tables(chunks: list[dict]) -> list[dict]:
     changed = 0
     for c in chunks:
         body = c.get("content_with_weight") or ""
-        flat = _flatten_tables(body)
+        flat = body  # _flatten_tables(body)
         if flat != body:
             c = dict(c)
             c["content_with_weight"] = flat
@@ -903,10 +903,10 @@ def build_keyword_agentic_graph_v5(
         # Flatten AFTER joining: a table split across chunks is whole again here, so
         # a header stranded in the previous chunk can still label these rows. This
         # also re-applies the flattening _retrieve did, which the join just replaced.
-        body = _flatten_tables(body)
-        heading = _nearest_heading(ordered, idx)
+        # body = _flatten_tables(body)
+        # heading = _nearest_heading(ordered, idx)
         out = dict(chunk)
-        out["content_with_weight"] = (f"Section: {heading}\n" if heading else "") + body
+        out["content_with_weight"] = body  # (f"Section: {heading}\n" if heading else "") + body
         return out
 
     # ── Assessment (batched, budget-bounded) ──
