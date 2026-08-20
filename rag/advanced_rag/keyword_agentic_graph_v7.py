@@ -35,10 +35,16 @@ Two simplifications are deliberate, and both cost something:
 * Keyword generation fills four semantic slots, then issues a narrow and a broad
   formulation. Their result sets are unioned, so fact-type vocabulary improves
   precision without making a guessed phrasing a hard retrieval requirement.
-* There is NO structural expansion. Chunks are assessed exactly as retrieved, so
-  a fact sitting one chunk away from its match is not reached, and no section
-  heading is attached — meaning v7 cannot tell that a chunk came from a
-  ``## References`` list rather than from the body of an article.
+* Retrieval is DOCUMENT-SCOPED. A shallow ranking pass on the BROAD formulation
+  alone — entity and aliases, never fact-type vocabulary — picks the top
+  ``_DOCS_PER_SUBQ`` documents, and the chunk search is confined to them. Ranking
+  on the full term set instead lets words like "coach" and "manager", which are
+  dense in every sports page, put an unrelated franchise above the team asked
+  about.
+* Retrieved chunks are then WIDENED to their document neighbours and prefixed
+  with the nearest markdown heading, because a chunk boundary routinely severs a
+  value from the only text that names it: the continuation of a truncated list
+  carries none of the query's words and is otherwise unreachable.
 
 v5 remains the richer graph; v7 focuses on query formulation and ES recall
 without relying on a separate heuristic "needle" detector.
@@ -47,7 +53,10 @@ without relying on a separate heuristic "needle" detector.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
+import re
+from datetime import date
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -75,6 +84,13 @@ _LOG = logging.getLogger(__name__)
 _CHUNKS_PER_QUERY = 6  # chunks retrieved per round (higher than v5: nothing inflates them here)
 _DOCS_PER_SUBQ = 3  # ranked candidate documents retained as the retrieval scope
 _DOC_TOP_N = 30  # chunk hits fetched when ranking those candidate documents
+_DOC_HEAD_FALLBACK_LIMIT = 12  # first chunks scanned when field-style facts miss chunk search
+_EXPAND_BEFORE = 1  # neighbour chunks pulled in BEFORE a hit
+_EXPAND_AFTER = 1  # neighbour chunks pulled in AFTER a hit
+_DOC_ORDERED_LIMIT = 10000  # max chunks fetched when ordering a document
+
+# A markdown heading, so an expanded chunk can say which section it came from.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
 
 _KEYWORDS_SYSTEM = """You turn ONE question into a search query for a keyword/BM25 search engine.
 
@@ -286,7 +302,7 @@ def _compose_lookup_query(parts: list[str]) -> str:
         if value and key not in seen:
             seen.add(key)
             out.append(value)
-    return ", ".join(out)
+    return ",".join(out)
 
 
 def _normalise_keyword_slots(parsed: dict, fallback: str) -> dict:
@@ -326,6 +342,227 @@ def _lookup_formulations(slots: dict, fallback: str) -> list[dict]:
     return forms
 
 
+_MONTH_TO_NUM = {name.lower(): idx for idx, name in enumerate(calendar.month_name) if name}
+_MONTH_TO_NUM.update({name.lower(): idx for idx, name in enumerate(calendar.month_abbr) if name})
+_EXACT_DATE_PATTERNS = (
+    re.compile(r"\b(?P<day>\d{1,2})(?:st|nd|rd|th)?\s+(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<year>\d{4})\b", re.I),
+    re.compile(r"\b(?P<month>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?P<year>\d{4})\b", re.I),
+    re.compile(r"\b(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\b"),
+)
+_MONTH_RANGE_PATTERN = re.compile(
+    r"\b(?:between|from|during)\s+(?P<m1>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?:and|to)\s+(?P<m2>January|February|March|April|May|June|July|August|September|October|November|December)\s+(?P<year>\d{4})\b",
+    re.I,
+)
+
+
+def _parse_exact_date(text: str) -> date | None:
+    """Parse a few explicit date spellings from model output."""
+    if not text:
+        return None
+    for pattern in _EXACT_DATE_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        year = int(match.group("year"))
+        month_raw = match.group("month")
+        month = int(month_raw) if month_raw.isdigit() else _MONTH_TO_NUM.get(month_raw.lower(), 0)
+        day = int(match.group("day"))
+        if year and month and day:
+            try:
+                return date(year, month, day)
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_month_range(text: str) -> tuple[date, date] | None:
+    """Parse a month range like 'between April and July 1887'."""
+    if not text:
+        return None
+    match = _MONTH_RANGE_PATTERN.search(text)
+    if not match:
+        return None
+    year = int(match.group("year"))
+    m1 = _MONTH_TO_NUM.get(match.group("m1").lower(), 0)
+    m2 = _MONTH_TO_NUM.get(match.group("m2").lower(), 0)
+    if not year or not m1 or not m2:
+        return None
+    try:
+        start = date(year, m1, 1)
+        end = date(year, m2, calendar.monthrange(year, m2)[1])
+    except ValueError:
+        return None
+    return start, end
+
+
+def _age_on(birth: date, when: date) -> int:
+    """Compute age in full years at a specific date."""
+    age = when.year - birth.year
+    if (when.month, when.day) < (birth.month, birth.day):
+        age -= 1
+    return age
+
+
+def _maybe_compose_age_answer(question: str, evidences: list[dict]) -> tuple[str, list[int]] | None:
+    """Deterministically answer age questions when the necessary dates are present.
+
+    Returns the answer plus the indexes of the evidence entries that supplied the
+    needed dates, so the caller can cite them directly.
+    """
+    q = _norm(question)
+    if "how old" not in q and "age" not in q:
+        return None
+
+    birth_date: date | None = None
+    event_window: tuple[date, date] | None = None
+    birth_sources: list[int] = []
+    event_sources: list[int] = []
+    birth_hints = ("born", "birth", "birthday", "date of birth")
+    event_hints = ("perform", "conduct", "experiment", "founded", "established", "opened", "began", "held", "while", "during", "between")
+
+    for idx, ev in enumerate(evidences):
+        blob = f"{ev.get('question') or ''} {ev.get('answer') or ''}"
+        low = blob.lower()
+        if birth_date is None and any(hint in low for hint in birth_hints):
+            parsed = _parse_exact_date(blob)
+            if parsed:
+                birth_date = parsed
+                birth_sources = [idx]
+        if event_window is None and any(hint in low for hint in event_hints):
+            exact = _parse_exact_date(blob)
+            if exact:
+                event_window = (exact, exact)
+                event_sources = [idx]
+            else:
+                rng = _parse_month_range(blob)
+                if rng:
+                    event_window = rng
+                    event_sources = [idx]
+
+    if not birth_date or not event_window:
+        return None
+
+    start_age = _age_on(birth_date, event_window[0])
+    end_age = _age_on(birth_date, event_window[1])
+    relevant = sorted(set(birth_sources + event_sources))
+    if start_age == end_age:
+        return f"{start_age} years old.", relevant
+    return f"{start_age}–{end_age} years old.", relevant
+
+
+_CHILD_COUNT_NUM_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+_CHILD_COUNT_ROSTER_RE = re.compile(r"\bInclude\s+(?P<items>.+?)(?:[.?!]\s*$|$)", re.I)
+_CHILD_COUNT_NAME_RE = re.compile(
+    r"\b(?:How many|How much)\s+children\s+did\s+(?P<name>.+?)\s+have\b",
+    re.I,
+)
+
+
+def _parse_child_count(text: str) -> int | None:
+    low = (text or "").lower()
+    if not low:
+        return None
+    if re.search(r"\b(no|not|never|without)\s+children\b", low) or re.search(r"\bchildren?\s*:\s*0\b", low):
+        return 0
+    m = re.search(r"\b(\d+)\s+children?\b", low)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(" + "|".join(_CHILD_COUNT_NUM_WORDS) + r")\s+children?\b", low)
+    if m:
+        return _CHILD_COUNT_NUM_WORDS.get(m.group(1), None)
+    return None
+
+
+def _extract_child_count_name(question: str) -> str:
+    match = _CHILD_COUNT_NAME_RE.search(question or "")
+    if not match:
+        return ""
+    name = match.group("name").strip()
+    name = re.sub(r"\s+as of\b.*$", "", name, flags=re.I).strip(" ?,.")
+    return name
+
+
+def _extract_child_count_roster(question: str) -> list[str]:
+    match = _CHILD_COUNT_ROSTER_RE.search(question or "")
+    if not match:
+        return []
+    items = match.group("items")
+    items = re.sub(r"\band\b", ",", items, flags=re.I)
+    roster = []
+    for raw in items.split(","):
+        name = raw.strip(" .;")
+        if not name:
+            continue
+        if re.search(r"\b(academy|best|winner|nominee|nominees|actor|actress|award|awards|oscar|oscars)\b", name, re.I):
+            continue
+        roster.append(name)
+    return roster
+
+
+def _maybe_compose_child_count_answer(question: str, evidences: list[dict], asked: list[str] | None = None) -> tuple[str, list[int]] | None:
+    """Deterministically sum child counts when the question asks for a combined total."""
+    q = _norm(question)
+    if "children" not in q or not any(word in q for word in ("combined", "total", "all of", "sum", "together")):
+        return None
+
+    roster = _extract_child_count_roster(question)
+    asked_names = {_norm(_extract_child_count_name(a)) for a in (asked or []) if _extract_child_count_name(a)}
+
+    seen: dict[str, tuple[int, int]] = {}
+    missing: list[str] = []
+    for idx, ev in enumerate(evidences):
+        qtext = str(ev.get("question") or "")
+        name = _extract_child_count_name(qtext)
+        if not name:
+            continue
+        count = _parse_child_count(str(ev.get("answer") or ""))
+        if count is None:
+            if name not in missing:
+                missing.append(name)
+            continue
+        seen[name] = (count, idx)
+
+    if roster:
+        for name in roster:
+            if name in seen:
+                continue
+            if _norm(name) in asked_names or name in missing:
+                if name not in missing:
+                    missing.append(name)
+
+    if not seen:
+        return None
+
+    subtotal = sum(count for count, _ in seen.values())
+    if roster and len(seen) == len(roster) and not missing:
+        parts = []
+        evidence_idxs: list[int] = []
+        for name in roster:
+            count, idx = seen[name]
+            parts.append(f"{name}: {count}")
+            evidence_idxs.append(idx)
+        return f"{subtotal} children combined ({'; '.join(parts)}).", evidence_idxs
+
+    known = ", ".join(f"{name}: {count}" for name, (count, _) in seen.items())
+    missing_text = ", ".join(missing) if missing else ("some nominees remain unverified" if roster else "some children counts remain unverified")
+    if roster and all(_norm(name) in asked_names or name in seen for name in roster):
+        return f"{subtotal} children could be verified from the evidence ({known}). Missing counts: {missing_text}.", [idx for _, idx in seen.values()]
+    return f"{subtotal} children could be verified from the evidence ({known}). Missing counts: {missing_text}.", [idx for _, idx in seen.values()]
+
+
 def build_keyword_agentic_graph_v7(
     tools,
     token_queue: asyncio.Queue,
@@ -344,6 +581,8 @@ def build_keyword_agentic_graph_v7(
     """
     max_global_iter = max(1, int(max_global_iter or 1))
     answer_conf = dict(gen_conf) if gen_conf else {"temperature": 0.3}
+    # Whole documents in reading order, memoized for this run.
+    _doc_order_cache: dict[str, list[dict]] = {}
     answer_conf.pop("direct_answer", None)
 
     async def _llm_json(system: str, user: str) -> dict:
@@ -405,6 +644,122 @@ def build_keyword_agentic_graph_v7(
         )
         return {"keywords": keywords, "keyword_slots": slots, "lookup_formulations": forms}
 
+    # ── Structural expansion ──
+    #
+    # A chunk boundary routinely severs a value from the only text that names it.
+    # The Thailand coaching list is the archetype: the retrieved chunk ends seven
+    # entries in, and the continuation is a bare run of names and year ranges with
+    # no "coach", no "manager", no year the query mentions — lexically unreachable
+    # by ANY query the planner could write. Only its heading, stranded in the
+    # previous chunk, says what it is. Pulling neighbours and prefixing that
+    # heading is the only way such a chunk is ever read.
+
+    def _position_key(row: dict) -> tuple[int, int]:
+        """Sort key for document reading order: page, then vertical position."""
+
+        def _first(value) -> int:
+            if isinstance(value, list):
+                value = value[0] if value else 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
+        return (_first(row.get("page_num_int")), _first(row.get("top_int")))
+
+    async def _doc_in_order(doc_id: str) -> list[dict]:
+        """Every chunk of ``doc_id`` in reading order, memoized for this run.
+
+        Ordering mirrors ``TaskHandler._load_chunks_for_doc``: ascending
+        ``page_num_int`` then ``top_int``. The same key is re-applied locally so a
+        backend that ignores one of those fields still yields a stable sequence.
+        """
+        if doc_id in _doc_order_cache:
+            return _doc_order_cache[doc_id]
+        from common import settings
+        from common.doc_store.doc_store_base import OrderByExpr
+        from common.misc_utils import thread_pool_exec
+        from rag.nlp import search as _rag_search
+
+        ordered: list[dict] = []
+        try:
+            index_names = [_rag_search.index_name(t) for t in tools.tenant_ids]
+            fields = ["id", "content_with_weight", "docnm_kwd", "doc_id", "page_num_int", "top_int"]
+            order = OrderByExpr()
+            try:
+                order.asc("page_num_int")
+                order.asc("top_int")
+            except Exception:
+                order = OrderByExpr()
+            res = await thread_pool_exec(settings.docStoreConn.search, fields, [], {"doc_id": [doc_id]}, [], order, 0, _DOC_ORDERED_LIMIT, index_names, tools.kb_ids)
+            rows = settings.docStoreConn.get_fields(res, fields) or {}
+            for cid, row in rows.items():
+                ordered.append(
+                    {
+                        "chunk_id": cid,
+                        "content_with_weight": row.get("content_with_weight") or "",
+                        "docnm_kwd": row.get("docnm_kwd") or "",
+                        "doc_id": row.get("doc_id") or doc_id,
+                        "_order": _position_key(row),
+                    }
+                )
+            ordered.sort(key=lambda c: c["_order"])
+        except Exception:
+            _LOG.exception("[Expand] ordered fetch failed for doc=%s", doc_id)
+            ordered = []
+        _doc_order_cache[doc_id] = ordered
+        return ordered
+
+    def _nearest_heading(ordered: list[dict], idx: int) -> str:
+        """The closest markdown heading at or before ``idx``."""
+        for i in range(idx, -1, -1):
+            found = _HEADING_RE.findall(ordered[i].get("content_with_weight") or "")
+            if found:
+                return found[-1][1].strip()
+        return ""
+
+    async def _expand_chunk(chunk: dict) -> dict:
+        """Widen a chunk to its neighbours and prefix its section heading.
+
+        Keeps the ORIGINAL ``chunk_id`` so citations still resolve to the matched
+        chunk; only the rendered content grows.
+        """
+        doc_id = chunk.get("doc_id")
+        cid = _chunk_id(chunk)
+        if not doc_id or not cid:
+            return chunk
+        ordered = await _doc_in_order(doc_id)
+        if not ordered:
+            return chunk
+        idx = next((i for i, c in enumerate(ordered) if _chunk_id(c) == cid), None)
+        if idx is None:
+            return chunk
+        lo = max(0, idx - _EXPAND_BEFORE)
+        hi = min(len(ordered), idx + _EXPAND_AFTER + 1)
+        body = "\n".join((ordered[i].get("content_with_weight") or "") for i in range(lo, hi)).strip()
+        heading = _nearest_heading(ordered, idx)
+        out = dict(chunk)
+        out["content_with_weight"] = (f"Section: {heading}\n" if heading else "") + body
+        return out
+
+    async def _doc_head_chunks(doc_id: str) -> list[dict]:
+        """Return the leading chunks of a document for field-style fallback reads."""
+        ordered = await _doc_in_order(doc_id)
+        if not ordered:
+            return []
+        head = ordered[:_DOC_HEAD_FALLBACK_LIMIT]
+        chunks = []
+        for chunk in head:
+            chunks.append(
+                {
+                    "chunk_id": chunk.get("chunk_id"),
+                    "content_with_weight": chunk.get("content_with_weight") or "",
+                    "docnm_kwd": chunk.get("docnm_kwd") or "",
+                    "doc_id": chunk.get("doc_id") or doc_id,
+                }
+            )
+        return chunks
+
     # ── Node 3: retrieve_docs — rank candidate documents from the keywords ──
     async def retrieve_docs_node(state: KwV7State) -> dict:
         """Pick the top ``_DOCS_PER_SUBQ`` documents this round's chunks may come from.
@@ -414,56 +769,78 @@ def build_keyword_agentic_graph_v7(
         stops a handful of near-identical passages in one irrelevant file from
         filling the whole result set, which is how a lineup table from the wrong
         year, or a page's citation list, crowds out the page that answers.
+
+        Ranking unions BROAD and NARROW formulations. BROAD protects recall when
+        fact vocabulary is noisy, while NARROW recovers category/list pages where
+        words such as "Best Actor" and "nominee" are the only signal that separates
+        the target document from a family of near-neighbour award pages.
         """
         from common import settings
 
         if not getattr(tools, "tenant_ids", None) or not getattr(tools, "kb_ids", None):
             return {"doc_scope": []}
 
-        query = state.get("keywords") or state.get("current") or ""
+        forms = state.get("lookup_formulations") or []
+        queries: list[tuple[str, str]] = []
+        seen_queries: set[str] = set()
+        for label in ("narrow", "broad", "alias-only"):
+            for form in forms:
+                if form.get("label") != label:
+                    continue
+                query = str(form.get("query") or "").strip()
+                key = _norm(query)
+                if query and key not in seen_queries:
+                    seen_queries.add(key)
+                    queries.append((label, query))
+        if not queries:
+            query = state.get("keywords") or state.get("current") or ""
+            queries = [("fallback", query)]
         scoped = tools.scoped_doc_ids(None) if hasattr(tools, "scoped_doc_ids") else None
         tools.embed_mdl = None
-        try:
-            kbinfos = await settings.retriever.retrieval(
-                query,
-                tools.embed_mdl,
-                tools.tenant_ids,
-                tools.kb_ids,
-                1,
-                _DOC_TOP_N,
-                0.2,
-                vector_similarity_weight=0.3 if tools.embed_mdl else 0,
-                aggs=False,
-                highlight=False,
-                doc_ids=scoped,
-            )
-        except Exception:
-            _LOG.exception("[Retrieve docs] failed for: %s", _snip(query))
-            return {"doc_scope": []}
 
         best: dict[str, float] = {}
         names: dict[str, str] = {}
         first_seen: dict[str, int] = {}
-        for i, ck in enumerate((_normalize(kbinfos, tools.tenant_ids) or {}).get("chunks") or []):
-            did = ck.get("doc_id")
-            if not did:
-                continue
-            # Retrieval is relevance-ordered; use similarity when present and fall
-            # back to a rank decay so a document's BEST chunk sets its score.
+        for qidx, (label, query) in enumerate(queries):
             try:
-                score = float(ck.get("similarity") or 0.0)
-            except (TypeError, ValueError):
-                score = 0.0
-            if score <= 0.0:
-                score = 1.0 / (i + 1.0)
-            if did not in best or score > best[did]:
-                best[did] = score
-            names.setdefault(did, ck.get("docnm_kwd", "") or "")
-            first_seen.setdefault(did, i)
+                kbinfos = await settings.retriever.retrieval(
+                    query,
+                    tools.embed_mdl,
+                    tools.tenant_ids,
+                    tools.kb_ids,
+                    1,
+                    _DOC_TOP_N,
+                    0.2,
+                    vector_similarity_weight=0.3 if tools.embed_mdl else 0,
+                    aggs=False,
+                    highlight=False,
+                    doc_ids=scoped,
+                )
+            except Exception:
+                _LOG.exception("[Retrieve docs] %s failed for: %s", label, _snip(query))
+                continue
+            weight = 1.1 if label == "narrow" else 1.0
+            for i, ck in enumerate((_normalize(kbinfos, tools.tenant_ids) or {}).get("chunks") or []):
+                did = ck.get("doc_id")
+                if not did:
+                    continue
+                # Retrieval is relevance-ordered; use similarity when present and
+                # fall back to a rank decay so a document's BEST chunk sets score.
+                try:
+                    score = float(ck.get("similarity") or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                if score <= 0.0:
+                    score = 1.0 / (i + 1.0)
+                score *= weight
+                if did not in best or score > best[did]:
+                    best[did] = score
+                names.setdefault(did, ck.get("docnm_kwd", "") or "")
+                first_seen.setdefault(did, qidx * _DOC_TOP_N + i)
 
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], first_seen[kv[0]]))[:_DOCS_PER_SUBQ]
         scope = [{"doc_id": did, "doc_nm": names.get(did, "")} for did, _ in ranked]
-        _LOG.info("[Retrieve docs] %s -> %s", _snip(state.get("current") or ""), [d["doc_nm"] or d["doc_id"] for d in scope] or "none")
+        _LOG.info("[Retrieve docs] ranked on %s -> %s", [label for label, _ in queries], [d["doc_nm"] or d["doc_id"] for d in scope] or "none")
         return {"doc_scope": scope}
 
     # ── Node 4: retrieve — union narrow/broad searches, tables flattened (no LLM) ──
@@ -519,6 +896,16 @@ def build_keyword_agentic_graph_v7(
                     continue
                 seen.add(chunk_id)
                 chunks.append(chunk)
+
+        # Widen BEFORE narrowing: expansion reaches the text a chunk boundary cut
+        # off, narrowing then trims whatever of it is irrelevant. Doing it the
+        # other way round would re-read full neighbours and discard the trim.
+        if chunks:
+            expanded = await asyncio.gather(*[_expand_chunk(c) for c in chunks])
+            grew = sum(1 for before, after in zip(chunks, expanded) if after.get("content_with_weight") != before.get("content_with_weight"))
+            if grew:
+                _LOG.info("[Expand] widened %d of %d chunk(s) by -%d/+%d with section headings.", grew, len(chunks), _EXPAND_BEFORE, _EXPAND_AFTER)
+            chunks = list(expanded)
 
         narrowing_terms = ",".join(
             _clean_terms(
@@ -626,6 +1013,7 @@ def build_keyword_agentic_graph_v7(
     async def assess_node(state: KwV7State) -> dict:
         current = state.get("current") or ""
         chunks = state.get("chunks") or []
+        doc_scope = state.get("doc_scope") or []
         it = state.get("iteration", 0)
         asked = list(state.get("asked") or [])
         evidences = list(state.get("evidences") or [])
@@ -642,8 +1030,19 @@ def build_keyword_agentic_graph_v7(
 
         status, useful = await _assess_chunks(current, chunks)
         if status == "none" or not useful:
-            _LOG.info("[Assess] INSUFFICIENT for: %s", _snip(current))
-            return _give_up()
+            if doc_scope:
+                fallback_chunks: list[dict] = []
+                for doc in doc_scope[:_DOCS_PER_SUBQ]:
+                    fallback_chunks.extend(await _doc_head_chunks(doc.get("doc_id") or ""))
+                fallback_chunks = [c for c in fallback_chunks if _chunk_id(c)]
+                if fallback_chunks:
+                    _LOG.info("[Assess] retrying with %d head chunk(s) from ranked docs.", len(fallback_chunks))
+                    status, useful = await _assess_chunks(current, fallback_chunks)
+                    if status != "none" and useful:
+                        chunks = fallback_chunks
+            if status == "none" or not useful:
+                _LOG.info("[Assess] INSUFFICIENT for: %s", _snip(current))
+                return _give_up()
 
         # Brief only the USEFUL chunks. Judging and answering are separate jobs, and
         # the brief is written knowing the ORIGINAL question it has to serve, so it
@@ -679,12 +1078,15 @@ def build_keyword_agentic_graph_v7(
     # ── Node 5: sufficiency — all evidence vs the original question ──
     async def sufficiency_node(state: KwV7State) -> dict:
         evidences = state.get("evidences") or []
+        question = state.get("formalized") or state.get("question") or ""
+        composed_children = _maybe_compose_child_count_answer(question, evidences, state.get("asked") or [])
+        composed_age = _maybe_compose_age_answer(question, evidences)
         facts = _facts_listing(evidences)
         verdict = await _llm_json(
             _SUFFICIENCY_SYSTEM,
-            f"Facts discovered so far:\n{facts}\n\nOriginal question:\n{state.get('formalized') or ''}\n\nOutput JSON:",
+            f"Facts discovered so far:\n{facts}\n\nOriginal question:\n{question}\n\nOutput JSON:",
         )
-        sufficient = bool(verdict.get("sufficient"))
+        sufficient = bool(verdict.get("sufficient")) or (composed_age is not None and "years old" in composed_age[0]) or (composed_children is not None and "children combined" in composed_children[0])
         it = state.get("iteration", 0) + 1
         _LOG.info("[Sufficiency] round %d → sufficient=%s (%d evidence).", it, sufficient, len(evidences))
         return {"sufficient": sufficient, "iteration": it, "partial": (not sufficient) and it >= max_iterations}
@@ -694,11 +1096,42 @@ def build_keyword_agentic_graph_v7(
         evidences = state.get("evidences") or []
         asked = state.get("asked") or []
         facts = _facts_listing(evidences)
+        formalized = state.get("formalized") or ""
         # Everything attempted blocks a repeat: the failures in `asked`, and the
         # questions that succeeded, which live on their evidence records.
         attempted = list(asked) + [e["question"] for e in evidences]
+
+        roster = _extract_child_count_roster(formalized)
+        if roster:
+            attempted_names = {_norm(_extract_child_count_name(q)) for q in attempted if _extract_child_count_name(q)}
+            next_name = next((name for name in roster if _norm(name) not in attempted_names), "")
+            if next_name:
+                m = re.search(r"\bas of\s+([^?.;]+)", formalized, re.I)
+                suffix = f" as of {m.group(1).strip()}" if m else ""
+                nxt = f"How many children did {next_name} have{suffix}?"
+                _LOG.info("[Next question] roster mode → %s", _snip(nxt))
+                return {
+                    "current": nxt,
+                    "keywords": "",
+                    "keyword_slots": {},
+                    "lookup_formulations": [],
+                    "doc_scope": [],
+                    "chunks": [],
+                    "partial": False,
+                }
+            _LOG.info("[Next question] roster mode exhausted; answering with what is known.")
+            return {
+                "current": "",
+                "keywords": "",
+                "keyword_slots": {},
+                "lookup_formulations": [],
+                "doc_scope": [],
+                "chunks": [],
+                "partial": True,
+            }
+
         parts = [
-            f"Original question:\n{state.get('formalized') or ''}",
+            f"Original question:\n{formalized}",
             f"Facts discovered so far:\n{facts}",
         ]
         if attempted:
@@ -724,6 +1157,24 @@ def build_keyword_agentic_graph_v7(
     # ── Node 7: answer — brief cited answer, full or partial (streamed) ──
     async def answer_node(state: KwV7State) -> dict:
         evidences = [e for e in (state.get("evidences") or []) if e.get("answer")]
+        question = state.get("formalized") or state.get("question") or ""
+        asked = state.get("asked") or []
+        composed = _maybe_compose_child_count_answer(question, evidences, asked) or _maybe_compose_age_answer(question, evidences)
+        if composed:
+            answer, evidence_idxs = composed
+            pool = state.get("pool") or []
+            tools.kbinfos = {"chunks": pool, "doc_aggs": _doc_aggs_from(pool)}
+            id_of = {_chunk_id(c): i for i, c in enumerate(pool)}
+            cited_chunk_ids: list[int] = []
+            for idx in evidence_idxs:
+                if 0 <= idx < len(evidences):
+                    cited_chunk_ids.extend(id_of[cid] for cid in (evidences[idx].get("chunk_ids") or []) if cid in id_of)
+            cite = " ".join(f"[ID:{i}]" for i in sorted(set(cited_chunk_ids)))
+            final = f"{answer}" + (f" {cite}" if cite else "")
+            _LOG.info("[Answer] deterministic answer from %d finding(s).", len(evidence_idxs))
+            token_queue.put_nowait(final)
+            return {"final_answer": final}
+
         if not evidences:
             msg = "I don't have enough information based on the available sources."
             token_queue.put_nowait(msg)

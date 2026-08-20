@@ -220,7 +220,7 @@ def _flatten_html_tables(text: str) -> str:
         rows = [[_html_cell_text(c) for c in _HTML_CELL.findall(r)] for r in _HTML_ROW.findall(block)]
         flat = _flatten_rows([r for r in rows if r])
         if flat:
-            text = text[:lo] + flat + text[hi:]
+            text = text[:lo] + f"<table>{flat}</table>" + text[hi:]
     return text
 
 
@@ -229,7 +229,7 @@ def _flatten_markdown_tables(text: str) -> str:
         rows = _md_table_rows(m.group(0))
         flat = _flatten_rows(rows) if rows else None
         if flat:
-            text = text[: m.start()] + flat + "\n" + text[m.end() :]
+            text = text[: m.start()] + f"<table>{flat}</table>" + "\n" + text[m.end() :]
     return text
 
 
