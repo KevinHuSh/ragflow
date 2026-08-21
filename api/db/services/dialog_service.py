@@ -1930,6 +1930,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         do_refer=False,
         thinking_mode=thinking_mode,
         text_attachments_content=text_attachments_content,
+        messages=messages,
     )
 
     async def decorate_answer(answer):

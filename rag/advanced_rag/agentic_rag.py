@@ -45,7 +45,7 @@ from common import settings
 from common.misc_utils import thread_pool_exec
 from common.token_utils import num_tokens_from_string
 from rag.advanced_rag.agentic_rag_graph import _split_think_stream
-from rag.advanced_rag.keyword_agentic_graph_v8 import run_keyword_agentic_rag_v8
+from rag.advanced_rag.keyword_agentic_graph_v9 import run_keyword_agentic_rag
 from rag.app.tag import label_question
 from rag.llm.tool_decorator import tool
 from rag.prompts.generator import (
@@ -86,6 +86,7 @@ class RAGTools:
         do_refer: bool | None = True,
         thinking_mode: str = "medium",
         text_attachments_content: str = "",
+        messages: list | None = None,
     ):
         self.tenant_ids = tenant_ids
         self.chat_mdl = chat_mdl.clone()
@@ -118,6 +119,14 @@ class RAGTools:
         self.empty_response = empty_response
         self.do_refer = do_refer
         self.text_attachments_content = text_attachments_content or ""
+        # The conversation as the USER wrote it. `rag` researches this, never a
+        # question composed by the model: `rag` is a TERMINAL tool, so whatever the
+        # model holds back from the call can never be finished afterwards — the
+        # loop returns the pipeline's answer and ends. A model that decomposes
+        # "add up the letters in their capitals" into "what are their capitals"
+        # therefore drops the arithmetic on the floor. Taking no question from it
+        # removes the opportunity rather than asking it not to.
+        self.messages = messages or []
         # Optional sink used by the outer agent stream to preserve the final
         # answer deltas produced by the inner research graph.  The tool API
         # still returns the complete string to the caller, but the stream
@@ -572,27 +581,38 @@ class RAGTools:
     # Bound tools
     # ------------------------------------------------------------------ #
     @tool(timeout=600)
-    async def rag(self, question: str) -> str:
-        """Answer a question with evidence from the knowledge bases and the web.
+    async def rag(self, **_ignored) -> str:
+        """Answer the user's current question with evidence from the knowledge bases and the web.
 
-        Runs the full agentic-search pipeline: it formalises the question,
-        narrows the document scope, analyses keywords, retrieves evidence,
-        checks whether the evidence is sufficient (looping with follow-up
-        searches when it is not), and finally composes a cited answer.
+        Takes NO arguments, and needs none: it reads the user's question from the
+        conversation itself. Do not restate, narrow or split the question — call
+        this and let the pipeline do all of it. It researches the WHOLE question
+        internally, decomposing multi-hop questions into sub-questions, looping
+        searches until the evidence suffices, performing any counting or arithmetic
+        the question calls for, and composing the cited answer.
 
-        :param question: a self-contained natural-language question.
+        Its result is the final answer to the user. Nothing runs after it, so there
+        is no later step in which to finish a part of the question yourself.
 
         :returns: the composed answer with inline citation markers.
         """
+
+        # ``**_ignored`` absorbs arguments a model invents out of habit — the schema
+        # declares none, but the dispatcher calls fn(**arguments) and an unexpected
+        # keyword would fail the call outright. Logged, because an argument here is
+        # the model trying to reword the question, which is what this signature
+        # exists to prevent. It is never read.
+        if _ignored:
+            logging.info("[rag] Ignoring caller-supplied argument(s): %s", str(_ignored)[:300])
 
         # Hard guard: run the pipeline at most once per user turn. The lock makes
         # the check-then-run atomic, so parallel tool_calls in the SAME round are
         # serialized and only the first one actually runs the pipeline; the rest
         # fall through to the cached answer below.
         async with self._rag_lock:
-            return await self._rag_once(question)
+            return await self._rag_once()
 
-    async def _rag_once(self, question: str) -> str:
+    async def _rag_once(self) -> str:
         """Body of :meth:`rag`, executed under ``self._rag_lock``."""
         if self._rag_answer is not None:
             logging.info("[rag] Already answered this turn; short-circuiting a repeat call.")
@@ -613,9 +633,12 @@ class RAGTools:
                 ],
                 "doc_aggs": [{"doc_id": "chat_attachment", "doc_name": "Chat attachment", "count": 1}],
             }
-        messages = [{"role": "user", "content": question}] if question else []
+        messages = [m for m in self.messages if m.get("content")]
+        if not any(m.get("role") == "user" for m in messages):
+            logging.warning("[rag] No user message in the conversation; nothing to research.")
+            return self.empty_response or "I don't have a question to research."
         final = ""
-        async for kind, delta in _split_think_stream(run_keyword_agentic_rag_v8(self, messages)):
+        async for kind, delta in _split_think_stream(run_keyword_agentic_rag(self, messages)):
             if kind == "answer":
                 final += delta
             if self.answer_sink is not None:

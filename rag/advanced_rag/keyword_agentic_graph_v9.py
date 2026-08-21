@@ -25,13 +25,28 @@ composed from the evidence list.
 
 Flow:
 
-    formalize → keywords → retrieve → assess → compute → sufficiency ─(sufficient)→ answer → END
-                   ↑                                     │        └──(out of rounds)──┐
-                   │                                     ↓(not yet)                   │
-                   └──────(new question)────────── next_question ──(nothing new)──────┤
-                   ↑                                                                  ↓
-                   └────────────(board wiped, attempt left)──────────────────────── retry
-                                                                (no attempt left)→ answer
+    keywords ⇄ overview (once)
+       │
+       ↓
+    retrieve → assess → compute → sufficiency ─(sufficient)→ answer → END
+       ↑                              │        └──(out of rounds)──┐
+       │                              ↓(not yet)                   │
+       └─(new question)────────  next_question ──(nothing new)─────┤
+       ↑   via keywords                                            ↓
+       └──────(board wiped, attempt left)───────────────────── retry
+                                             (no attempt left)→ answer
+
+`overview` runs ONCE per run, on the first pass out of `keywords`: one wide search
+whose chunks are discarded, keeping only the titles of the documents the original
+question touches. Those titles are background for `keywords` and `next_question` —
+they tell the planner what this corpus holds and what it calls things. They filter
+NOTHING: retrieval scope, the citation pool, the evidence and the answer are all
+untouched by them.
+
+The user's question enters VERBATIM and is researched as asked. There is no
+rewriting step: a model that restates the question before searching drops the part
+it means to handle later — the arithmetic, the count, the comparison — and nothing
+downstream can tell that it went missing.
 
 An attempt that ends without an answer is not the end of the run: while a retry is
 left, `retry` clears every trace of it — evidence, chunk pool, asked questions, round
@@ -84,6 +99,7 @@ _LOG = logging.getLogger(__name__)
 
 # Tunable caps.
 _CHUNKS_PER_QUERY = 6  # chunks retrieved per round (higher than v5: nothing inflates them here)
+_DOC_TOP_N = 256  # chunks scanned ONCE to learn which documents the question touches
 _ENTITY_REPEAT = 3  # copies of each ENTITY term in the query, to weight it up
 
 # Entity terms are what discriminate; fact-type vocabulary and qualifiers are common
@@ -542,9 +558,10 @@ _PARTIAL_PREAMBLE = (
 
 
 class KwV6State(TypedDict, total=False):
-    question: str  # the raw last user message
-    formalized: str  # the standalone question rebuilt from the conversation
-    current: str  # the question being researched THIS round
+    question: str  # the user's question, verbatim — the thing that must be answered
+    current: str  # the sub-question being researched THIS round
+    doc_names: list  # dataset overview: titles only, background knowledge, never a filter
+    overviewed: bool  # the overview has run — once per RUN, and a retry does not undo it
     keywords: str  # search terms for `current`, one copy each, comma-separated
     query: str  # the string actually searched: `keywords` with the entity weighted up
     chunks: list  # chunks retrieved for `current`
@@ -557,6 +574,29 @@ class KwV6State(TypedDict, total=False):
     sufficient: bool
     partial: bool
     final_answer: str
+
+
+def _overview_block(doc_names: list[str]) -> str:
+    """Render the dataset overview for a prompt, or "" when there is none.
+
+    Titles tell a planner what this corpus actually contains and what words it
+    uses for it — that a question about "the Bombers" will find a "Flin Flon
+    Bombers" article, that a season table exists at all. The caveat below is not
+    boilerplate: a title list is the most tempting thing in the prompt to treat as
+    a shortlist, and doing that would silently narrow the search to whatever a
+    single question-shaped query happened to rank in one pass.
+    """
+    if not doc_names:
+        return ""
+    return (
+        "Documents in the knowledge base that the ORIGINAL question touched (titles only):\n"
+        + "\n".join(f"- {n}" for n in doc_names)
+        + "\n\nThis list is BACKGROUND ONLY. It shows what this corpus holds and the words it uses "
+        "for things — nothing more. It is NOT a shortlist of where the answer is, NOT a set to "
+        "search within, and a title's ABSENCE is NOT evidence that the corpus lacks something: the "
+        "list comes from one shallow pass over titles and is cut off. Never narrow, redirect or "
+        "abandon a question to fit it.\n\n"
+    )
 
 
 def _numbered(chunks: list[dict]) -> str:
@@ -598,18 +638,15 @@ def _pick(chunks: list[dict], numbers: object) -> list[dict]:
     return out
 
 
-def build_keyword_agentic_graph_v8(
+def build_keyword_agentic_graph(
     tools,
     token_queue: asyncio.Queue,
-    messages: list | None = None,
     gen_conf: dict | None = None,
     max_iterations: int = 5,
     max_retry_number: int = 1,
 ):
     """Compile the v6 graph.
 
-    :param messages: the full conversation, used once to rebuild a standalone
-        question. Falls back to the raw question when unavailable.
     :param max_iterations: rounds of (keywords → retrieve → assess) before the
         attempt ends with whatever evidence it has.
     :param max_retry_number: extra attempts at the whole question after an attempt
@@ -627,37 +664,12 @@ def build_keyword_agentic_graph_v8(
             ans = ans[0]
         return _extract_json(ans)
 
-    # ── Node 1: formalize — rebuild a standalone question from the chat history ──
-    async def formalize_node(state: KwV6State) -> dict:
-        raw = state.get("question") or ""
-        formalized = raw
-        """
-        if messages:
-            try:
-                rebuilt = await full_question(messages=messages, chat_mdl=tools.chat_mdl)
-                if rebuilt and rebuilt.strip():
-                    formalized = rebuilt.strip()
-            except Exception:
-                _LOG.exception("[Formalize] failed; falling back to the raw question")
-        """
-        if _norm(formalized) != _norm(raw):
-            _LOG.info("[Formalize] %s  ->  %s", _snip(raw), _snip(formalized))
-        else:
-            _LOG.info("[Formalize] unchanged: %s", _snip(formalized))
-        return {
-            "formalized": formalized,
-            "current": formalized,
-            "iteration": 0,
-            "evidences": [],
-            "asked": [],
-            "pool": [],
-            "partial": False,
-        }
-
-    # ── Node 2: keywords — four aspects of the question, the entity weighted up ──
+    # ── Node 1: keywords — four aspects of the question, the entity weighted up ──
     async def keywords_node(state: KwV6State) -> dict:
-        current = state.get("current") or ""
-        parsed = await _llm_json(_KEYWORDS_SYSTEM, f"Question:\n{current}\n\nOutput JSON:")
+        # First round of an attempt researches the user's question as written.
+        current = state.get("current") or state.get("question") or ""
+        user = f"Question:\n{current}" + "\n\nOutput JSON:"
+        parsed = await _llm_json(_overview_block(state.get("doc_names") or []) + _KEYWORDS_SYSTEM, user)
 
         # ONE dedup set across all four categories: a term the model emits as both an
         # entity and an alias must not collect a second share of the query's mass on
@@ -693,6 +705,58 @@ def build_keyword_agentic_graph_v8(
             "; ".join(aspects["qualifiers"]) or "-",
         )
         return {"keywords": keywords, "query": query}
+
+    # ── Node 2: overview — which documents does this question touch at all? ──
+    async def overview_node(state: KwV6State) -> dict:
+        """Learn the corpus once, from the ORIGINAL question, before researching it.
+
+        One wide search whose CHUNKS ARE THROWN AWAY: only the document titles are
+        kept, as background for the two nodes that write questions and keywords.
+        Nothing here filters anything — the titles never reach `retrieve`'s scope,
+        the citation pool, the evidence, or the answer.
+
+        Runs once per RUN. ``overviewed`` is deliberately absent from what `retry`
+        clears, so a wiped attempt keeps what the corpus looks like, and it is set
+        even when the search fails — otherwise `keywords → overview → keywords`
+        would loop until the recursion limit.
+        """
+        from common import settings
+
+        question = state.get("question") or ""
+        if not getattr(tools, "tenant_ids", None) or not getattr(tools, "kb_ids", None):
+            _LOG.warning("[Overview] skipped: no tenant or knowledge-base scope is available.")
+            return {"overviewed": True, "doc_names": []}
+
+        try:
+            kbinfos = await settings.retriever.retrieval(
+                question,
+                tools.embed_mdl,
+                tools.tenant_ids,
+                tools.kb_ids,
+                1,
+                _DOC_TOP_N,
+                0.0,  # widest net: nothing downstream is filtered by what this finds
+                vector_similarity_weight=0.3 if tools.embed_mdl else 0,
+                aggs=True,  # the aggregation IS the result; the chunks are incidental
+                highlight=False,
+                doc_ids=tools.scoped_doc_ids(None) if hasattr(tools, "scoped_doc_ids") else None,
+            )
+        except Exception:
+            _LOG.exception("[Overview] failed for: %s", _snip(question))
+            return {"overviewed": True, "doc_names": []}
+
+        # `doc_aggs` is one entry per document, ordered by how many of the scanned
+        # chunks came from it — a usable relevance order, and already deduped.
+        names: list[str] = []
+        seen: set[str] = set()
+        for agg in (kbinfos or {}).get("doc_aggs") or []:
+            name = str(agg.get("doc_name") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+
+        _LOG.info("[Overview] %d document(s) across %d scanned chunk(s): %s", len(names), _DOC_TOP_N, _snip(", ".join(names)))
+        return {"overviewed": True, "doc_names": names}
 
     # ── Node 3: retrieve — one search, tables flattened (no LLM) ──
     async def retrieve_node(state: KwV6State) -> dict:
@@ -849,7 +913,7 @@ def build_keyword_agentic_graph_v8(
         # keeps the exact date/number/name the later steps will need.
         parsed = await _llm_json(
             _BRIEF_ANSWER_SYSTEM,
-            f"Question:\n{current}\n\nORIGINAL question this serves:\n{state.get('formalized') or ''}\n\nChunks:\n{_numbered(useful)}\n\nOutput JSON:",
+            f"Question:\n{current}\n\nORIGINAL question this serves:\n{state.get('question') or ''}\n\nChunks:\n{_numbered(useful)}\n\nOutput JSON:",
         )
         answer = str(parsed.get("answer") or "").strip()
         if not answer:
@@ -883,7 +947,7 @@ def build_keyword_agentic_graph_v8(
 
         parsed = await _llm_json(
             _COMPUTE_SYSTEM,
-            f"Facts discovered so far:\n{_facts_listing(evidences)}\n\nOriginal question:\n{state.get('formalized') or ''}\n\nOutput JSON:",
+            f"Facts discovered so far:\n{_facts_listing(evidences)}\n\nOriginal question:\n{state.get('question') or ''}\n\nOutput JSON:",
         )
         if not parsed.get("needed"):
             return {}
@@ -938,7 +1002,7 @@ def build_keyword_agentic_graph_v8(
         facts = _facts_listing(evidences)
         verdict = await _llm_json(
             _SUFFICIENCY_SYSTEM,
-            f"Facts discovered so far:\n{facts}\n\nOriginal question:\n{state.get('formalized') or ''}\n\nOutput JSON:",
+            f"Facts discovered so far:\n{facts}\n\nOriginal question:\n{state.get('question') or ''}\n\nOutput JSON:",
         )
         sufficient = bool(verdict.get("sufficient"))
         it = state.get("iteration", 0) + 1
@@ -955,14 +1019,14 @@ def build_keyword_agentic_graph_v8(
         # questions that succeeded, which live on their evidence records.
         attempted = list(asked) + [e["question"] for e in evidences]
         parts = [
-            f"Original question:\n{state.get('formalized') or ''}",
+            f"Original question:\n{state.get('question') or ''}",
             f"Facts discovered so far:\n{facts}",
         ]
         if attempted:
             parts.append("Already asked (never repeat or rephrase any of these):\n" + "\n".join(f"- {a}" for a in attempted))
         parts.append("Output JSON:")
 
-        parsed = await _llm_json(_NEXT_QUESTION_SYSTEM, "\n\n".join(parts))
+        parsed = await _llm_json(_overview_block(state.get("doc_names") or []) + _NEXT_QUESTION_SYSTEM, "\n\n".join(parts))
         nxt = str(parsed.get("question") or "").strip()
         if nxt and any(_norm(a) == _norm(nxt) for a in attempted):
             _LOG.info("[Next question] discarded a repeat of an earlier question: %s", _snip(nxt))
@@ -990,7 +1054,7 @@ def build_keyword_agentic_graph_v8(
 
         system = FINAL_ANSWER_SYSTEM.format(cite_rules=citation_prompt(tools.user_defined_prompts).strip())
         system += _NO_REASONING_RULE
-        head = f"Question:\n{state.get('formalized') or state.get('question') or ''}\n\n"
+        head = f"Question:\n{state.get('question') or ''}\n\n"
         partial = bool(state.get("partial")) or not state.get("sufficient")
         # Out of rounds with findings in hand is a different situation from having
         # run out of angles: the graph stops asking, but a labelled inference from
@@ -1024,16 +1088,16 @@ def build_keyword_agentic_graph_v8(
 
     # ── Node 9: retry — wipe the board and research the question again ──
     async def retry_node(state: KwV6State) -> dict:
-        """Reset to what ``formalize`` produced, keeping only the question itself.
+        """Reset to the starting position, keeping only the user's question.
 
         An attempt that ends unanswered chose its questions, its keywords and its
         chunks in one connected trajectory; the second and third question were
         built on the evidence the first one found. Preserving any of it would steer
-        the retry down the same path, so the board is wiped and only the standalone
-        question survives.
+        the retry down the same path, so the board is wiped and only the question
+        itself survives.
         """
         retries = state.get("retries", 0) + 1
-        formalized = state.get("formalized") or state.get("question") or ""
+        question = state.get("question") or ""
         _LOG.info(
             "[Retry] attempt %d of %d ended unanswered after %d round(s) — discarding %d evidence and %d pooled chunk(s), restarting: %s",
             retries,
@@ -1041,24 +1105,30 @@ def build_keyword_agentic_graph_v8(
             state.get("iteration", 0),
             len(state.get("evidences") or []),
             len(state.get("pool") or []),
-            _snip(formalized),
+            _snip(question),
         )
         return {
-            "current": formalized,
+            "current": question,
             "keywords": "",
             "query": "",
             "chunks": [],
-            "evidences": [],
             "asked": [],
             "pool": [],
             "iteration": 0,
             "sufficient": False,
             "partial": False,
             "retries": retries,
+            # `doc_names` and `overviewed` are deliberately NOT reset: what the
+            # corpus contains did not change because an attempt failed, and the
+            # overview is a once-per-run cost.
         }
 
     def _retry_exhausted(state: KwV6State) -> bool:
         return state.get("retries", 0) >= max_retry_number
+
+    def _route_after_keywords(state: KwV6State) -> str:
+        """One trip through `overview`, then straight to `retrieve` for good."""
+        return "retrieve" if state.get("overviewed") else "overview"
 
     def _route_after_sufficiency(state: KwV6State) -> str:
         if state.get("sufficient"):
@@ -1076,8 +1146,8 @@ def build_keyword_agentic_graph_v8(
         return "answer" if _retry_exhausted(state) else "retry"
 
     g = StateGraph(KwV6State)
-    g.add_node("formalize", formalize_node)
     g.add_node("keywords", keywords_node)
+    g.add_node("overview", overview_node)
     g.add_node("retrieve", retrieve_node)
     g.add_node("assess", assess_node)
     g.add_node("sufficiency", sufficiency_node)
@@ -1086,9 +1156,9 @@ def build_keyword_agentic_graph_v8(
     g.add_node("compute", compute_node)
     g.add_node("answer", answer_node)
 
-    g.add_edge(START, "formalize")
-    g.add_edge("formalize", "keywords")
-    g.add_edge("keywords", "retrieve")
+    g.add_edge(START, "keywords")
+    g.add_conditional_edges("keywords", _route_after_keywords, {"overview": "overview", "retrieve": "retrieve"})
+    g.add_edge("overview", "keywords")
     g.add_edge("retrieve", "assess")
     g.add_edge("assess", "sufficiency")
     g.add_conditional_edges("sufficiency", _route_after_sufficiency, {"next_question": "next_question", "retry": "retry", "answer": "compute"})
@@ -1099,7 +1169,7 @@ def build_keyword_agentic_graph_v8(
     return g.compile()
 
 
-async def run_keyword_agentic_rag_v8(
+async def run_keyword_agentic_rag(
     tools,
     messages: list,
     max_iterations: int = 9,
@@ -1114,10 +1184,9 @@ async def run_keyword_agentic_rag_v8(
             break
 
     token_queue: asyncio.Queue = asyncio.Queue()
-    graph = build_keyword_agentic_graph_v8(
+    graph = build_keyword_agentic_graph(
         tools,
         token_queue,
-        messages=messages,
         gen_conf=gen_conf,
         max_iterations=max_iterations,
         max_retry_number=max_retry_number,
@@ -1130,6 +1199,7 @@ async def run_keyword_agentic_rag_v8(
             holder["state"] = await graph.ainvoke(
                 {
                     "question": question,
+                    "current": question,
                     "max_iterations": max_iterations,
                     "iteration": 0,
                     "evidences": [],
