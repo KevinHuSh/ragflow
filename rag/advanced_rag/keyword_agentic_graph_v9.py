@@ -434,11 +434,24 @@ outside knowledge, no reasoning shown (except for common public knowledge like a
 - Answer the question that was ASKED. If the chunks state a closely related figure instead, give the
   asked-for value only when it follows from them by a trivial, certain derivation, and say which
   figure it came from. Otherwise state plainly what the chunks do say.
+- A question naming part of a DOCUMENT — "the bibliography section", "the infobox", "the table of
+  contents" — is asking about that part's CONTENT. Chunking routinely severs a heading from what
+  sits under it, so the heading being absent from these chunks says nothing about whether the
+  content is here. Answer from the works, figures or entries you can see; never make the presence
+  of a heading a condition for answering.
 - "relevant": the NUMBERS of the chunks your answer rests on.
-- If nothing useful detail can support answer the QUESTION, keep "answer" and "relevant" empty.
-Output ONLY JSON, no prose, no code fences:
-{"answer": "<one or two factual sentences>", "relevant": [<chunk number>, ...]}"""
+- "found": false when these chunks do not let you answer the QUESTION even partially, true when they do.
 
+WHEN THE CHUNKS DO NOT ANSWER THE QUESTION, say nothing at all: set "found" false and leave "answer"
+and "relevant" EMPTY. A sentence ABOUT the chunks is NOT an answer — "the provided chunks do not
+contain the bibliography section", "the text does not state the year", "this cannot be determined
+from the given passages" are all the empty answer, written the long way. Anything you put in
+"answer" is recorded as a DISCOVERED FACT and shown to every later step as though a source had
+stated it, so an explanation of what is missing becomes a finding that says nothing and cites
+chunks that support nothing. Report what the chunks DO state, or report nothing.
+Output ONLY JSON, no prose, no code fences:
+
+{"answer": "<one or two factual sentences, or empty>", "relevant": [<chunk number>, ...], "found": true/false}"""
 _SUFFICIENCY_SYSTEM = """You are given the ORIGINAL question and every fact discovered so far.
 Decide ONLY whether those facts are enough to answer the ORIGINAL question completely and directly.
 Do NOT propose follow-up research and do NOT answer the question.
@@ -517,6 +530,12 @@ question to ask next.
 - KEEP THE ORIGINAL QUESTION'S WORDING for the thing being asked. Do not swap in a near-synonym that
   means something else ("make up" is not "own", "worth" is not "earned"): sources tend to state a
   fact in the asker's own phrasing, so re-wording it loses the text that holds the answer.
+- ASK ABOUT THE WORLD, NOT ABOUT A DOCUMENT. "What is in the bibliography section of the Wikipedia
+  article on José Saramago?" cannot be answered by a search: retrieval returns passages, not
+  sections, and chunking has already separated that heading from the works listed under it. Ask
+  "What books did José Saramago write?" instead. Keep the asker's wording for the THING being asked,
+  but drop the container it was described as living in — the article, the section, the table, the
+  infobox, the list. Search for the content, never for its packaging.
 - NEVER repeat or rephrase anything under "Already asked" — those rounds are spent. Attack the gap
   from a genuinely different angle: a different entity, source or attribute.
 - If no genuinely NEW and useful question exists — every angle is spent, or the sources plainly
@@ -916,7 +935,11 @@ def build_keyword_agentic_graph(
             f"Question:\n{current}\n\nORIGINAL question this serves:\n{state.get('question') or ''}\n\nChunks:\n{_numbered(useful)}\n\nOutput JSON:",
         )
         answer = str(parsed.get("answer") or "").strip()
-        if not answer:
+        # ``found`` is the reliable half of this: a model that has nothing to report
+        # will still often write a sentence explaining that it has nothing, and such
+        # a sentence would be recorded as a fact and drag its chunks into the
+        # citation pool. Absent (older shape) counts as found, so nothing regresses.
+        if not answer or parsed.get("found") is False:
             _LOG.info("[Assess] useful chunks found but no brief was produced — recording the question as asked.")
             return _give_up()
 

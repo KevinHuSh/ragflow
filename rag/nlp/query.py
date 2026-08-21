@@ -83,7 +83,7 @@ class FulltextQueryer(QueryBase):
                     % (
                         tks_w[i - 1][0],
                         tks_w[i][0],
-                        max(tks_w[i - 1][1], tks_w[i][1]) * 2,
+                        max(tks_w[i - 1][1], tks_w[i][1]) * 8,
                     )
                 )
             if not q:

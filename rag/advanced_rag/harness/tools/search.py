@@ -288,9 +288,9 @@ def _narrow_content(content: str, kwds: list[str]) -> str | None:
             # max(-1, ...) so sentence 0 is reachable and the backward window is
             # 5 wide, matching the forward one; max(0, ...) excluded index 0
             # outright, so a chunk's opening sentence could never be context.
-            for j in range(i - 1, max(-1, i - 2), -1):
+            for j in range(i - 1, max(-1, i - 3), -1):
                 keep.add(j)
-            for j in range(i + 1, min(i + 2, len(sents))):
+            for j in range(i + 1, min(i + 3, len(sents))):
                 keep.add(j)
     if not matched:
         return None
@@ -347,6 +347,7 @@ def _narrow_by_keywords(chunks: list[dict], keywords: str) -> list[dict]:
                 ck["content"] = nc
             ck.pop("highlight", None)
             ck["token_num"] = num_tokens_from_string(nc)
+            ck["positions"] = ck.get("positions", [0])
             out.append(ck)
     return out
 
