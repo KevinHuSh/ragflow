@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 from copy import deepcopy
-from rag.advanced_rag.agentic_rag import RAGTools
+from rag.advanced_rag.agentic_rag_v1 import RAGTools
 
 logger = logging.getLogger(__name__)
 from datetime import datetime, timezone

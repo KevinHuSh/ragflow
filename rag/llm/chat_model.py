@@ -231,7 +231,7 @@ class Base(ABC):
         # Configure retry parameters
         self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
         self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
-        self.max_rounds = kwargs.get("max_rounds", 5)
+        self.max_rounds = kwargs.get("max_rounds", 25)
         self.is_tools = False
         self.tools = []
         self.toolcall_sessions = {}
