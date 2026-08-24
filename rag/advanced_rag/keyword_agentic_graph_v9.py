@@ -115,8 +115,16 @@ _ENTITY_REPEAT = 3  # copies of each ENTITY term in the query, to weight it up
 # is what weights it.
 # One query, one ranked result set, no merge step.
 
-# The four aspects the keyword prompt returns, in query order.
-_KEYWORD_ASPECTS = ("entity", "aliases", "fact_type", "qualifiers")
+_MUST_REPEAT = 10  # copies of each MUST word — the words a document cannot omit
+
+# The five aspects the keyword prompt returns, in query order. "must" leads: it is
+# both the heaviest and the one whose terms should win the cross-aspect dedup, so a
+# word that appears twice is kept where it counts for most.
+_KEYWORD_ASPECTS = ("must", "entity", "aliases", "fact_type", "qualifiers")
+
+# How many copies of each aspect's terms go into the query. Everything unlisted goes
+# in once; see the note above on what repetition buys.
+_ASPECT_REPEAT = {"must": _MUST_REPEAT, "entity": _ENTITY_REPEAT}
 
 
 # ── Arithmetic over the evidence ───────────────────────────────────────────────
@@ -347,9 +355,16 @@ def _compute(expression: str) -> tuple[str, str]:
 
 _KEYWORDS_SYSTEM = """You turn ONE question into search terms for a keyword/BM25 search engine.
 
-Emit the terms that would appear VERBATIM in a document that answers the question, sorted into FOUR
+Emit the terms that would appear VERBATIM in a document that answers the question, sorted into FIVE
 categories. Every term must come from the question itself or be a surface form of something in it.
 
+M. "must" — the one, two, or at most three WORDS that a document answering this question could not
+   possibly leave out: the surname, the rare noun, the identifier that everything else hangs on.
+   SINGLE WORDS ONLY — no spaces, no phrases; a phrase here is split apart before it is used.
+   These are weighted TEN times over and will dominate what gets retrieved, so a generic word
+   ("year", "album", "team", "city", "song") drags the entire search into noise, and a wrong word
+   buries the answer outright. Pick only words whose absence from a document PROVES that document
+   cannot hold the answer. When no single word is that decisive, emit fewer — or none.
 A. "entity" — the specific thing the fact is ABOUT: proper nouns, titles, identifiers. Keep a
    multi-word entity whole, as ONE term ("Brown County", "Treaty of Versailles"); split across
    several terms its tokens match independently and drag in noise. A bare identifier — a serial,
@@ -382,16 +397,19 @@ D. "qualifiers" — year, edition, jurisdiction, revision. Worth emitting even w
    ("2000000" -> "two million", "2 million"), and each common date format ("Aug 2nd" -> "August 2",
    "2 August", "08-02").
 
-A and B are what FINDS the document; C and D only boost the ranking. So never withhold an entity
-because you are unsure of it, and never pad C or D to reach a count.
+M is the sharpest instrument and the most dangerous: it decides WHICH documents are reachable at
+all. A and B are what finds the right one among them; C and D only boost the ranking. So never
+withhold an entity because you are unsure of it, never pad C or D to reach a count, and never put a
+word in M to be thorough.
 
 DROP entirely: question words ("which", "who", "when", "how many"), relational scaffolding, and
 generic high-frequency nouns ("year", "number", "city", "total", "list", "information"). They cost
 ranking quality and retrieve nothing.
 
 Output ONLY JSON, no prose, no code fences:
-{"entity": ["<term>", ...], "aliases": ["<term>", ...], "fact_type": ["<term>", ...], "qualifiers": ["<term>", ...]}
-Any category may be empty; leave "entity" empty only when the question truly names nothing."""
+{"must": ["<word>", ...], "entity": ["<term>", ...], "aliases": ["<term>", ...], "fact_type": ["<term>", ...], "qualifiers": ["<term>", ...]}
+Any category may be empty; leave "entity" empty only when the question truly names nothing, and
+prefer an empty "must" over a doubtful word in it."""
 
 _ASSESS_SYSTEM = """You are given a QUESTION and a consecutive, numbered batch of chunks.
 Judge EACH chunk independently. Do NOT write the answer here.
@@ -440,7 +458,7 @@ outside knowledge, no reasoning shown (except for common public knowledge like a
   content is here. Answer from the works, figures or entries you can see; never make the presence
   of a heading a condition for answering.
 - "relevant": the NUMBERS of the chunks your answer rests on.
-- "found": false when these chunks do not let you answer the QUESTION even partially, true when they do.
+- "found": false when nothing in these chunks helpful/useful to the given QUESTION, true when they do.
 
 WHEN THE CHUNKS DO NOT ANSWER THE QUESTION, say nothing at all: set "found" false and leave "answer"
 and "relevant" EMPTY. A sentence ABOUT the chunks is NOT an answer — "the provided chunks do not
@@ -584,6 +602,8 @@ class KwV6State(TypedDict, total=False):
     keywords: str  # search terms for `current`, one copy each, comma-separated
     query: str  # the string actually searched: `keywords` with the entity weighted up
     chunks: list  # chunks retrieved for `current`
+    page: int  # which page of results `current` is being answered from, 1-based
+    next_page: bool  # set by `assess`: this page was barren, read the next one
     evidences: list  # [{iteration, question, answer, chunk_ids}]
     asked: list  # questions attempted that produced no evidence
     pool: list  # retained chunks — the citation set, dedup by id
@@ -663,6 +683,7 @@ def build_keyword_agentic_graph(
     gen_conf: dict | None = None,
     max_iterations: int = 5,
     max_retry_number: int = 1,
+    max_page4retrieval: int = 2,
 ):
     """Compile the v6 graph.
 
@@ -672,6 +693,10 @@ def build_keyword_agentic_graph(
         ends without an answer. Each one wipes the board — evidence, chunk pool,
         asked questions, round counter — and researches the question from scratch,
         so 0 restores the single-attempt behaviour and 1 allows two attempts.
+    :param max_page4retrieval: pages of results one question may work through. A
+        page that yields nothing useful is not the end of the question — the same
+        query is run again for the next page, and only when the pages run out is the
+        question recorded as spent. 1 restores the single-page behaviour.
     """
     answer_conf = dict(gen_conf) if gen_conf else {"temperature": 0.0}
     answer_conf.pop("direct_answer", None)
@@ -698,11 +723,15 @@ def build_keyword_agentic_graph(
         for aspect in _KEYWORD_ASPECTS:
             terms: list[str] = []
             for k in parsed.get(aspect) or []:
-                term = str(k).strip()
-                key = _norm(term)
-                if term and key and key not in seen:
-                    seen.add(key)
-                    terms.append(term)
+                # "must" is single WORDS. A phrase slipped into a x10 slot would also
+                # weight the adjacent-token clause the query builder derives from it,
+                # so it is split apart rather than trusted or thrown away.
+                for term in str(k).split() if aspect == "must" else [str(k)]:
+                    term = term.strip()
+                    key = _norm(term)
+                    if term and key and key not in seen:
+                        seen.add(key)
+                        terms.append(term)
             aspects[aspect] = terms
 
         # `keywords` is the plain union, one copy each — it is what narrows retrieved
@@ -710,13 +739,14 @@ def build_keyword_agentic_graph(
         # be deduped again. Fact-type vocabulary belongs in it: the sentence carrying
         # the value ("The population was 5,432") often does not name the entity.
         keywords = ", ".join(t for aspect in _KEYWORD_ASPECTS for t in aspects[aspect]) or current
-        weighted = [t for t in aspects["entity"] for _ in range(_ENTITY_REPEAT)]
-        weighted += [t for aspect in _KEYWORD_ASPECTS[1:] for t in aspects[aspect]]
+        weighted = [t for aspect in _KEYWORD_ASPECTS for t in aspects[aspect] for _ in range(_ASPECT_REPEAT.get(aspect, 1))]
         query = ", ".join(weighted) or keywords
 
         _LOG.info(
-            "[Keywords] %s -> entity x%d: %s | aliases: %s | fact-type: %s | qualifiers: %s",
+            "[Keywords] %s -> must x%d: %s | entity x%d: %s | aliases: %s | fact-type: %s | qualifiers: %s",
             _snip(current),
+            _MUST_REPEAT,
+            "; ".join(aspects["must"]) or "-",
             _ENTITY_REPEAT,
             "; ".join(aspects["entity"]) or "-",
             "; ".join(aspects["aliases"]) or "-",
@@ -787,6 +817,10 @@ def build_keyword_agentic_graph(
 
         query = state.get("query") or state.get("keywords") or state.get("current") or ""
         doc_ids = tools.scoped_doc_ids(None) if hasattr(tools, "scoped_doc_ids") else None
+        tools.embed_mdl = None
+        # Deeper pages are the SAME query, read further down the ranking. `assess`
+        # sends the graph back here when a page held nothing worth keeping.
+        page = max(1, int(state.get("page") or 1))
 
         try:
             kbinfos = await settings.retriever.retrieval(
@@ -794,7 +828,7 @@ def build_keyword_agentic_graph(
                 tools.embed_mdl,
                 tools.tenant_ids,
                 tools.kb_ids,
-                1,
+                page,
                 _CHUNKS_PER_QUERY,
                 0.2,
                 vector_similarity_weight=0.3 if tools.embed_mdl else 0,
@@ -824,7 +858,7 @@ def build_keyword_agentic_graph(
             # not that the results were worthless.
             _LOG.info("[Retrieve] narrowing removed every chunk; keeping the %d retrieved as-is.", len(chunks))
 
-        _LOG.info("[Retrieve] %d chunk(s) for: %s", len(chunks), _snip(state.get("current") or ""))
+        _LOG.info("[Retrieve] %d chunk(s) from page 【%d / %d】 for: %s", len(chunks), page, max_page4retrieval, _snip(state.get("current") or ""))
         return {"chunks": chunks}
 
     # ── Assessment (batched, budget-bounded) ──
@@ -913,19 +947,34 @@ def build_keyword_agentic_graph(
         evidences = list(state.get("evidences") or [])
         pool = list(state.get("pool") or [])
 
-        def _give_up() -> dict:
+        page = max(1, int(state.get("page") or 1))
+
+        def _give_up(*, more_pages: bool) -> dict:
+            """Nothing kept from this page.
+
+            While pages remain the question is NOT spent — the same query is read
+            further down the ranking — so it must not go into ``asked`` yet, or the
+            planner would refuse to ask it again while it is still being answered.
+            """
+            out = {"evidences": evidences, "asked": asked, "pool": pool, "next_page": more_pages}
+            if more_pages:
+                out["page"] = page + 1
+                return out
             if current and not any(_norm(a) == _norm(current) for a in asked):
                 asked.append(current)
-            return {"evidences": evidences, "asked": asked, "pool": pool}
+            return out
 
         if not chunks:
-            _LOG.info("[Assess] no chunks retrieved — recording the question as asked.")
-            return _give_up()
+            # An empty page means the query is out of results, not that the next
+            # page might hold better ones: stop paging and spend the question.
+            _LOG.info("[Assess] page %d returned nothing — recording the question as asked.", page)
+            return _give_up(more_pages=False)
 
         status, useful = await _assess_chunks(current, chunks)
         if status == "none" or not useful:
-            _LOG.info("[Assess] INSUFFICIENT for: %s", _snip(current))
-            return _give_up()
+            more = page < max_page4retrieval
+            _LOG.info("[Assess] INSUFFICIENT on page %d/%d%s for: %s", page, max_page4retrieval, " — reading the next page" if more else "", _snip(current))
+            return _give_up(more_pages=more)
 
         # Brief only the USEFUL chunks. Judging and answering are separate jobs, and
         # the brief is written knowing the ORIGINAL question it has to serve, so it
@@ -940,8 +989,9 @@ def build_keyword_agentic_graph(
         # a sentence would be recorded as a fact and drag its chunks into the
         # citation pool. Absent (older shape) counts as found, so nothing regresses.
         if not answer or parsed.get("found") is False:
-            _LOG.info("[Assess] useful chunks found but no brief was produced — recording the question as asked.")
-            return _give_up()
+            more = page < max_page4retrieval
+            _LOG.info("[Assess] page %d/%d held useful chunks but no brief was produced%s.", page, max_page4retrieval, " — reading the next page" if more else "")
+            return _give_up(more_pages=more)
 
         cited = _pick(useful, parsed.get("relevant")) or useful
         seen = {_chunk_id(c) for c in pool}
@@ -959,8 +1009,8 @@ def build_keyword_agentic_graph(
                 "chunk_ids": [_chunk_id(c) for c in cited],
             }
         )
-        _LOG.info("[Assess] ANSWERED (%s): %s -> %s", status, _snip(current), _snip(answer))
-        return {"evidences": evidences, "asked": asked, "pool": pool}
+        _LOG.info("[Assess] ANSWERED (%s) on page %d: %s -> %s", status, page, _snip(current), _snip(answer))
+        return {"evidences": evidences, "asked": asked, "pool": pool, "next_page": False}
 
     # ── Node 5: compute — the one number the sources never state outright ──
     async def compute_node(state: KwV6State) -> dict:
@@ -1055,7 +1105,7 @@ def build_keyword_agentic_graph(
             _LOG.info("[Next question] discarded a repeat of an earlier question: %s", _snip(nxt))
             nxt = ""
         _LOG.info("[Next question] round %d → %s", state.get("iteration", 0), _snip(nxt) if nxt else "(none — answering with what is known)")
-        return {"current": nxt, "keywords": "", "chunks": [], "partial": not nxt}
+        return {"current": nxt, "keywords": "", "chunks": [], "page": 1, "partial": not nxt}
 
     # ── Node 8: answer — brief cited answer, full or partial (streamed) ──
     async def answer_node(state: KwV6State) -> dict:
@@ -1135,6 +1185,7 @@ def build_keyword_agentic_graph(
             "keywords": "",
             "query": "",
             "chunks": [],
+            "page": 1,
             "asked": [],
             "pool": [],
             "iteration": 0,
@@ -1152,6 +1203,16 @@ def build_keyword_agentic_graph(
     def _route_after_keywords(state: KwV6State) -> str:
         """One trip through `overview`, then straight to `retrieve` for good."""
         return "retrieve" if state.get("overviewed") else "overview"
+
+    def _route_after_assess(state: KwV6State) -> str:
+        """A barren page sends the SAME query back for the next one.
+
+        `assess` sets ``next_page`` explicitly on every exit, and only when it has
+        already bumped ``page``. Inferring this from the page number instead would
+        be ambiguous at the last page — "3 of 3" looks identical whether it was just
+        reached or just exhausted — and the graph would loop there forever.
+        """
+        return "retrieve" if state.get("next_page") else "sufficiency"
 
     def _route_after_sufficiency(state: KwV6State) -> str:
         if state.get("sufficient"):
@@ -1183,7 +1244,7 @@ def build_keyword_agentic_graph(
     g.add_conditional_edges("keywords", _route_after_keywords, {"overview": "overview", "retrieve": "retrieve"})
     g.add_edge("overview", "keywords")
     g.add_edge("retrieve", "assess")
-    g.add_edge("assess", "sufficiency")
+    g.add_conditional_edges("assess", _route_after_assess, {"retrieve": "retrieve", "sufficiency": "sufficiency"})
     g.add_conditional_edges("sufficiency", _route_after_sufficiency, {"next_question": "next_question", "retry": "retry", "answer": "compute"})
     g.add_conditional_edges("next_question", _route_after_next_question, {"keywords": "keywords", "retry": "retry", "answer": "compute"})
     g.add_edge("retry", "keywords")
@@ -1198,6 +1259,7 @@ async def run_keyword_agentic_rag(
     max_iterations: int = 9,
     gen_conf: dict | None = None,
     max_retry_number: int = 1,
+    max_page4retrieval: int = 2,
 ):
     """Drive the v6 graph, yielding answer-token strings."""
     question = ""
@@ -1213,6 +1275,7 @@ async def run_keyword_agentic_rag(
         gen_conf=gen_conf,
         max_iterations=max_iterations,
         max_retry_number=max_retry_number,
+        max_page4retrieval=max_page4retrieval,
     )
     _SENTINEL = object()
     holder: dict[str, Any] = {}
@@ -1223,6 +1286,7 @@ async def run_keyword_agentic_rag(
                 {
                     "question": question,
                     "current": question,
+                    "page": 1,
                     "max_iterations": max_iterations,
                     "iteration": 0,
                     "evidences": [],
@@ -1231,9 +1295,10 @@ async def run_keyword_agentic_rag(
                     "partial": False,
                     "retries": 0,
                 },
-                # Every retry re-walks the whole graph, so the step budget covers
-                # all attempts, not one.
-                {"recursion_limit": max(25, max_iterations * 8 * (max_retry_number + 1) + 10)},
+                # Every retry re-walks the whole graph and every round may read up
+                # to `max_page4retrieval` pages, so the step budget covers all
+                # attempts and all pages, not one of each.
+                {"recursion_limit": max(25, max_iterations * (4 + 2 * max(1, max_page4retrieval)) * (max_retry_number + 1) + 10)},
             )
         except Exception:
             _LOG.exception("run_keyword_agentic_rag_v6: graph execution failed")
