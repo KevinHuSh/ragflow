@@ -478,18 +478,6 @@ class Base(ABC):
         if tools:
             terminal_tools = set(getattr(self, "terminal_tools", None) or ())
 
-            def _tool_name(tool) -> str:
-                if isinstance(tool, dict):
-                    fn = tool.get("function") or {}
-                    return str(fn.get("name") or tool.get("name") or "")
-                schema = getattr(tool, "openai_schema", None)
-                if isinstance(schema, dict):
-                    fn = schema.get("function") or {}
-                    return str(fn.get("name") or schema.get("name") or getattr(tool, "__name__", "") or "")
-                return str(getattr(tool, "__name__", "") or "")
-
-            if any(_tool_name(tool) == "rag" for tool in tools):
-                terminal_tools.add("rag")
             if terminal_tools:
                 self.terminal_tools = terminal_tools
 
@@ -680,6 +668,8 @@ class Base(ABC):
                             ans += _reasoning + "</think>"
                             yield ans
                         else:
+                            if reasoning_start:
+                                yield "</think>"
                             reasoning_start = False
                             answer += delta.content
                             yield delta.content
@@ -722,7 +712,7 @@ class Base(ABC):
                             args = json_repair.loads(tc.function.arguments)
                         except Exception:
                             args = {}
-                        yield f"<think>Running the {tc.function.name} tool...</think>"
+                        yield f"\n<think>Running the {tc.function.name} tool...</think>"
                     _terminal = getattr(self, "terminal_tools", None)
                     if _terminal:
                         results = None
@@ -1723,9 +1713,9 @@ class LiteLLMBase(ABC):
         self.api_key = key
         self.base_url = (base_url or FACTORY_DEFAULT_BASE_URL.get(self.provider, "")).rstrip("/")
         # Configure retry parameters
-        self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 5)))
+        self.max_retries = kwargs.get("max_retries", int(os.environ.get("LLM_MAX_RETRIES", 12)))
         self.base_delay = kwargs.get("retry_interval", float(os.environ.get("LLM_BASE_DELAY", 2.0)))
-        self.max_rounds = kwargs.get("max_rounds", 5)
+        self.max_rounds = kwargs.get("max_rounds", 25)
         self.is_tools = False
         self.tools = []
         self.toolcall_sessions = {}
@@ -2271,6 +2261,9 @@ class LiteLLMBase(ABC):
                             ans += _reasoning + "</think>"
                             yield ans
                         else:
+                            if reasoning_start:
+                                answer += "</think>"
+                                yield "</think>"
                             reasoning_start = False
                             answer += delta.content
                             if _sanitizer is not None:

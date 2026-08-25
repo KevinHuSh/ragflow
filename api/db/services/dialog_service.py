@@ -1989,8 +1989,6 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
     # the model calls it, stream its result and stop — otherwise the model would
     # have to relay the (citation-bearing) answer through another round, which
     # small models mangle or drop, so the client receives nothing.
-    if getattr(chat_mdl, "mdl", None) is not None:
-        chat_mdl.mdl.terminal_tools = {"rag"}
     if stream:
         # Surface the outer model's reasoning, agent progress logs, and the
         # final-answer model's reasoning as one continuous think block. The
@@ -2035,28 +2033,57 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         answer_deltas = []
         answer_started = False
         think_closed = False
+        think_open = False
         outer_tool_started = False
 
+        async def _open_think():
+            """Open the progress block, unless it is already open.
+
+            Everything the user should read as progress rather than as answer goes
+            inside it: the model's reasoning, agent log lines, the "Running the X
+            tool" notice, and the call/result the tool loop echoes afterwards. The
+            notice arrives BEFORE the tool is invoked, so the block always opens
+            ahead of the invocation.
+            """
+            nonlocal think_open, think_closed
+            if think_open:
+                return
+            think_open = True
+            think_closed = False
+            yield {"answer": "", "reference": {}, "audio_binary": None, "final": False, "start_to_think": True}
+
+        async def _close_think():
+            """Close the progress block, unless it is already closed.
+
+            The block is not a one-shot latch: a model working through several tools
+            opens and closes it once per invocation, and whatever it says between
+            brackets is the answer.
+            """
+            nonlocal think_open, think_closed
+            if not think_open:
+                return
+            think_open = False
+            think_closed = True
+            yield {"answer": "", "reference": {}, "audio_binary": None, "final": False, "end_to_think": True}
+
         async def _close_think_and_flush_answer():
-            nonlocal answer_started, think_closed
-            if not think_closed:
-                yield {"answer": "", "reference": {}, "audio_binary": None, "final": False, "end_to_think": True}
-                think_closed = True
+            nonlocal answer_started
+            async for output in _close_think():
+                yield output
             if not answer_started:
                 answer_started = True
                 for delta in answer_deltas:
                     yield {"answer": delta, "reference": {}, "audio_binary": tts(tts_mdl, delta), "final": False}
 
         try:
-            # The outer model emits this as a synthetic <think> token while it
-            # invokes the terminal tool.  Make it part of the single progress
-            # block instead of forwarding its marker separately.
-            yield {"answer": "", "reference": {}, "audio_binary": None, "final": False, "start_to_think": True}
+            # The block is opened by the first piece of progress rather than up
+            # front, so a model that answers without calling a tool never shows an
+            # empty thinking section.
             while True:
                 item = await event_queue.get()
                 if item[0] == "log":
-                    if think_closed:
-                        continue
+                    async for output in _open_think():
+                        yield output
                     yield {"answer": item[1] + "\n", "reference": {}, "audio_binary": None, "final": False}
                     continue
                 if item[0] == "tool_started":
@@ -2070,10 +2097,10 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                     yield {"answer": item[1], "reference": {}, "audio_binary": tts(tts_mdl, item[1]), "final": False}
                     continue
                 if item[0] == "inner_think":
-                    if think_closed:
-                        continue
                     value = re.sub(r"</?think>", "", item[1])
                     if value:
+                        async for output in _open_think():
+                            yield output
                         yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
                     continue
                 if item[0] == "stream_done":
@@ -2084,24 +2111,50 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                     # block opened above; they must not create extra markers.
                     continue
 
-                # Forward outer-model thinking text, including any tail that
-                # arrives after the research-complete log.  The state tells us
-                # whether this is still inside the model's think section.
-                # Once that section is closed and the terminal tool has
-                # started, subsequent text is the aggregate tool result and is
-                # intentionally ignored.
+                value = re.sub(r"</?think>", "", value)
+                if not value:
+                    continue
+
+                # Outer-model reasoning, and the "Running the X tool..." notice the
+                # tool loop emits BEFORE it invokes anything — so the bracket opens
+                # ahead of the invocation.
                 if state is not None and state.in_think:
-                    value = re.sub(r"</?think>", "", value)
-                    if value:
-                        yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
-                elif not outer_tool_started:
-                    # Some providers omit explicit reasoning metadata and
-                    # emit plain text before the tool call. Preserve it as
-                    # outer thinking for compatibility with async_chat.
-                    value = re.sub(r"</?think>", "", value)
-                    if value:
-                        yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
-            if not think_closed:
+                    async for output in _open_think():
+                        yield output
+                    yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+                    continue
+
+                if "<tool_call>" in value:
+                    # The call, its arguments and its result, echoed once the
+                    # invocation returns. It is progress — with document-reading
+                    # tools this blob is an entire retrieved document — and it marks
+                    # the END of the invocation, so the bracket closes on it.
+                    async for output in _open_think():
+                        yield output
+                    yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+                    async for output in _close_think():
+                        yield output
+                    continue
+
+                if think_closed:
+                    # Past a tool invocation and outside the model's think section:
+                    # this is the answer, in the model's own voice. It must reach
+                    # `answer_deltas`, or the final message carries nothing.
+                    # `answer_started` marks it as ALREADY streamed, so the tail does
+                    # not replay the buffer and send every delta twice.
+                    answer_started = True
+                    answer_deltas.append(value)
+                    yield {"answer": value, "reference": {}, "audio_binary": tts(tts_mdl, value), "final": False}
+                    continue
+
+                if not outer_tool_started:
+                    # Some providers omit explicit reasoning metadata and emit plain
+                    # text before the tool call. Preserve it as outer thinking for
+                    # compatibility with async_chat.
+                    async for output in _open_think():
+                        yield output
+                    yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+            if think_open or not answer_started:
                 async for output in _close_think_and_flush_answer():
                     yield output
         finally:

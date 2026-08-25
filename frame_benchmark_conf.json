@@ -1,0 +1,37 @@
+{
+  "frames_mapping_path": "/home/kevinhu/ragflow_agent/conf/frames_mapping.json",
+  "question_sample_count": 30,
+  "sample_strategy": "random",
+  "sample_seed": 42,
+  "ragflow_api_key1": "ragflow--7oo_o6MjDh7MBsCzB5vJ_PWAE5NlQSr3zOujs5uW7M",
+  "ragflow_api_key":"ragflow-1r5e0lLUXeXU96BxLxF1RSWP035wA5hiKbnsiVTLQtE",
+  "ragflow_api_key_env_var": "RAGFLOW_API_KEY",
+  "chat_id": "eac5c278899711f1b4189f1c8d2cb12b",
+  "chat_id1": "d0943846705e11f18c525f5d797d9b44",
+  "backend": {
+    "scheme": "http",
+    "host": "192.168.1.24",
+    "port": 9383
+  },
+  "timeout_seconds": 1800,
+  "retry": {
+    "max_retries": 2,
+    "backoff_seconds": 2.0
+  },
+  "ragflow_chat": {
+    "fresh_session_per_question": true,
+    "stream": false
+  },
+  "judge": {
+    "stream": false,
+    "chat_id1": "7e92ed607b4b11f1987d047c16ec874f",
+    "chat_id": "19ec899476a411f1a73e09da42aa5ba8",
+    "judgement_prompt": "You are a strict evaluator for FRAMES-style QA results. Compare the candidate answer against the reference answer for semantic correctness, not exact wording. Return JSON only.\n\nEvaluate whether the candidate answer correctly answers the question.\n\nUse this fixed 0/2/4 rule book:\n- 4 = fully correct: the candidate contains the same essential factual answer as the reference.\n- 2 = partially correct: the candidate includes some required facts but is incomplete, vague, or missing required disambiguating detail.\n- 0 = incorrect: the candidate gives a different entity, date, number, location, title, relation, cause, event, contradicts the reference, is irrelevant, refuses to answer, or is a non-answer.\nAccept paraphrases, equivalent date/number formats, aliases, reordered wording, and harmless extra context.\nContradictory extra context prevents a score of 4.\nFor multi-part answers, all required parts must be present for score 4.\nJudge only final answer correctness; do not reward retrieval quality or citations.\n\nQuestion:\n{question}\n\nReference answer:\n{gold_answer}\n\nCandidate answer:\n{ragflow_answer}\n\nRespond with a JSON object with keys: \"score\" (one of 0, 2, 4), \"verdict\" (one of \"correct\", \"partial\", \"incorrect\"), \"confidence_note\" (number between 0 and 1), \"reason\", \"matched_facts\" (array of strings), \"missing_or_wrong_facts\" (array of strings)."
+  },
+  "output": {
+    "output_dir": "outputs/frame_benchmark_<timestamp>",
+    "answers_jsonl": "answers.jsonl",
+    "judged_jsonl": "judged_answers.jsonl",
+    "report_json": "report.json"
+  }
+}

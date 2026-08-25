@@ -646,6 +646,7 @@ class RAGTools:
     async def brief(self, question: str) -> str:
         """Turn the passages you just read into one factual answer.
 
+        Call this ever after `read_document` or `compute` before formal answer.
         Answers from the passages the LAST `read_document` call returned — you do
         not pass them back. Use it to fix a hop's answer before moving on, so the
         exact date, number or name survives into the next question.
@@ -680,7 +681,7 @@ class RAGTools:
             _LOG.info("[brief] the passages do not answer: %s", question[:120])
             return "These passages do not answer that question."
         self._working_question = question
-        _LOG.info("[brief] %s -> %s", question[:80], answer[:120])
+        _LOG.info("[brief] %s -> %s...", question[:80], answer[:120])
         return answer
 
     # ------------------------------------------------------------------ #
