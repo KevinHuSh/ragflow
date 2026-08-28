@@ -421,7 +421,7 @@ class RAGTools:
         return (
             "You research questions with four tools. Work one hop at a time.\n"
             "1. `find_documents` — name the entity you need and get back candidate documents "
-            "(IDs and titles). It returns no text; it tells you WHERE to read.\n"
+            "(IDs, titles and snippet). It tells you WHERE to read.\n"
             "2. `read_document` — read ONE candidate with the words you expect to see. It returns "
             "the matching passages in document order. Read the most promising candidate first, and "
             "try the next one when it does not hold the answer.\n"
@@ -480,6 +480,7 @@ class RAGTools:
         # document worth opening, and a long document would otherwise win on volume.
         best: dict[str, float] = {}
         names: dict[str, str] = {}
+        contents: dict[str, str] = {}
         first_seen: dict[str, int] = {}
         for i, ck in enumerate(kbinfos.get("chunks") or []):
             did = ck.get("doc_id")
@@ -496,10 +497,11 @@ class RAGTools:
             if did not in best or score > best[did]:
                 best[did] = score
             names.setdefault(did, ck.get("docnm_kwd", "") or "")
+            contents.setdefault(did, contents.get(did, "") + "..." + ck.get("content_with_weight", "")[:512] or "")
             first_seen.setdefault(did, i)
 
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], first_seen[kv[0]]))[:_DOC_CANDIDATES]
-        out = [{"doc_id": did, "doc_name": names.get(did, "")} for did, _ in ranked]
+        out = [{"doc_id": did, "doc_name": names.get(did, ""), "snippet": contents.get(did, "") + "..."} for did, _ in ranked]
         _LOG.info("[find_documents] %s -> %s", query[:80], [d["doc_name"] or d["doc_id"] for d in out] or "none")
         return out
 

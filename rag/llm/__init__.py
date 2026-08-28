@@ -128,7 +128,7 @@ LITELLM_PROVIDER_PREFIX = {
     SupportedLiteLLMProvider.AI_302: "openai/",
     SupportedLiteLLMProvider.JiekouAI: "openai/",
     SupportedLiteLLMProvider.ZHIPU_AI: "openai/",
-    SupportedLiteLLMProvider.MiniMax: "openai/",
+    SupportedLiteLLMProvider.MiniMax: "minimax/",
     SupportedLiteLLMProvider.DeerAPI: "openai/",
     SupportedLiteLLMProvider.GPUStack: "openai/",
     SupportedLiteLLMProvider.OpenAI: "openai/",
