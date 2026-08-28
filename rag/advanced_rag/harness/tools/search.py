@@ -266,7 +266,7 @@ def _sentence_matches(low: str, stems: list[str], verbatim: list[str], stemmed: 
     return False
 
 
-def _narrow_content(content: str, kwds: list[str]) -> str | None:
+def _narrow_content(content: str, kwds: list[str], around: int = 3) -> str | None:
     """Return ``content`` narrowed to keyword sentences +/- 5 neighbours.
 
     Matching is inflection-tolerant: a keyword matches any word sharing its stem,
@@ -288,9 +288,9 @@ def _narrow_content(content: str, kwds: list[str]) -> str | None:
             # max(-1, ...) so sentence 0 is reachable and the backward window is
             # 5 wide, matching the forward one; max(0, ...) excluded index 0
             # outright, so a chunk's opening sentence could never be context.
-            for j in range(i - 1, max(-1, i - 3), -1):
+            for j in range(i - 1, max(-1, i - around), -1):
                 keep.add(j)
-            for j in range(i + 1, min(i + 3, len(sents))):
+            for j in range(i + 1, min(i + around, len(sents))):
                 keep.add(j)
     if not matched:
         return None

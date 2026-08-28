@@ -62,8 +62,8 @@ from rag.utils.web_search_conn import WebSearchProvider
 _LOG = logging.getLogger(__name__)
 
 # ── Tunable caps ───────────────────────────────────────────────────────────────
-_DOC_TOP_N = 30  # chunk hits scanned when ranking candidate documents
-_DOC_CANDIDATES = 3  # candidate documents returned per call
+_DOC_TOP_N = 12  # chunk hits scanned when ranking candidate documents
+_DOC_CANDIDATES = 6  # candidate documents returned per call
 _DOC_CHUNK_PAGE = 128  # rows per chunk_list page while walking one document
 
 
@@ -456,6 +456,13 @@ class RAGTools:
         if not self.kb_ids or not (query or "").strip():
             return []
 
+        snippet_kwds = [k.strip().lower() for k in query.split(" ") if k.strip()]
+        if len(snippet_kwds) < 5:
+            query_terms = [k.strip().lower() for k in query.split() if k.strip()]
+            snippet_kwds = [f"{query_terms[i]} {query_terms[i + 1]}" for i in range(len(query_terms) - 1)]
+        if not snippet_kwds:
+            snippet_kwds = [query.strip().lower()]
+
         vec_weight = 0.3 if self.embed_mdl else 0
         try:
             kbinfos = await settings.retriever.retrieval(
@@ -497,7 +504,9 @@ class RAGTools:
             if did not in best or score > best[did]:
                 best[did] = score
             names.setdefault(did, ck.get("docnm_kwd", "") or "")
-            contents.setdefault(did, contents.get(did, "") + "..." + ck.get("content_with_weight", "")[:512] or "")
+            narrowed = _narrow_content(_chunk_text(ck), snippet_kwds, around=1)
+            snippet = narrowed if narrowed is not None else _chunk_text(ck)[:512]
+            contents[did] = contents.get(did, "") + "..." + snippet
             first_seen.setdefault(did, i)
 
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], first_seen[kv[0]]))[:_DOC_CANDIDATES]
